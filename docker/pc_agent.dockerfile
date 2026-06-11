@@ -1,8 +1,8 @@
 FROM ubuntu:22.04
 
-# ── 系统依赖 ─────────────────────────────────────────────
+# ── 系统基础 ─────────────────────────────────────────────
 RUN apt update && apt install -y --no-install-recommends \
-    python3.10 python3-pip curl git locales \
+    python3.10 python3-pip curl git locales ros-dev-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # ROS 2 Humble
@@ -16,15 +16,18 @@ RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | \
     python3-colcon-common-extensions \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python 依赖 ──────────────────────────────────────────
-COPY pyproject.toml /rai/pyproject.toml
-RUN pip3 install uv && cd /rai && uv sync --no-dev
+# ── 克隆 RAI ─────────────────────────────────────────────
+RUN git clone --depth=1 https://github.com/RobotecAI/rai.git /rai
 
-# ── RAI 源码 + PC Agent ─────────────────────────────────
-COPY src/      /rai/src/
+# ── 安装 RAI 依赖 ──────────────────────────────────────
+RUN pip3 install uv && cd /rai && uv sync
+
+# ── 安装 PC Agent ──────────────────────────────────────
 COPY examples/pc_agent/ /rai/examples/pc_agent/
 COPY config.toml /rai/config.toml
-COPY setup_shell.sh /rai/setup_shell.sh
+
+# ── 安装 ros_deps (rai_interfaces) ────────────────────
+RUN cd /rai && vcs import src < ros_deps.repos || true
 
 # ── 构建 ─────────────────────────────────────────────────
 WORKDIR /rai
