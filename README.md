@@ -107,6 +107,25 @@ Agent: 已找到床，正在导航前往 (2.12m, -1.62m)...
 Agent: 导航已取消，小车停止。
 ```
 
+---
+
+## Docker 部署（推荐用于 Orin）
+
+适合 Orin 系统太老（Ubuntu 20 + ROS 2 Foxy）或不支持直接安装 RAI 的情况。
+
+```bash
+# 在 Orin 上
+cd pc_agent_rai
+docker build -t pc-agent -f docker/pc_agent.dockerfile .
+docker run -d --name pc-agent --network=host --restart=always pc-agent
+```
+
+`--network=host` 让容器共享 Orin 的网络，ROS 2 DDS 自动与 Orin 上的 Votenet、Nav2 互通。
+
+PC 通过浏览器访问: `http://<orin-ip>:8501`
+
+---
+
 ## License
 
 Apache 2.0
