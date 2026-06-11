@@ -1,6 +1,6 @@
 # PC Agent — 自然语言控制无人车
 
-基于 RAI 框架，通过自然语言指令控制搭载 Jetson Orin 的无人车完成 3D 室内目标检测与自主导航。
+基于 [RAI](https://github.com/RobotecAI/rai) 框架，通过自然语言指令控制搭载 Jetson Orin 的无人车完成 3D 室内目标检测与自主导航。
 
 ## 架构
 
@@ -12,9 +12,72 @@ PC (LLM) ←→ ROS 2 DDS ←→ Orin (Votenet + Nav2)
    └─ 执行 ROS 2 通信         └─ 零代码改动
 ```
 
-**LLM 只做决策，Agent 做执行，Orin 做动作。** 核心创新：通过文字协议驱动工具调用，不依赖模型原生 Function Calling，兼容任意 LLM。
+**LLM 只做决策，Agent 做执行，Orin 做动作。** 手动 ReAct 协议驱动工具调用，不依赖模型原生 Function Calling，兼容任意 LLM（gemma2 / llama / qwen）。
 
-## 文件结构
+---
+
+## 已有 RAI 项目？直接使用
+
+```bash
+cd 你的RAI项目
+git clone https://github.com/chencong-coder/pc_agent_rai.git tmp_pc
+cp tmp_pc/examples/pc_agent examples/pc_agent -r
+cp tmp_pc/config.toml ./
+rm -rf tmp_pc
+source setup_shell.sh
+python -m examples.pc_agent.main
+```
+
+## 全新安装
+
+```bash
+# 1. 克隆 RAI
+git clone https://github.com/RobotecAI/rai.git
+cd rai
+
+# 2. 安装依赖
+uv sync
+
+# 3. 安装 PC Agent
+git clone https://github.com/chencong-coder/pc_agent_rai.git pc_agent_repo
+cp pc_agent_repo/examples/pc_agent examples/pc_agent -r
+cp pc_agent_repo/config.toml ./
+rm -rf pc_agent_repo
+
+# 4. 构建并启动
+colcon build --symlink-install
+source setup_shell.sh
+python -m examples.pc_agent.main
+```
+
+---
+
+## 配置模型
+
+编辑 `config.toml`，改成你的 Ollama 模型和地址：
+
+```toml
+[ollama]
+simple_model = "qwen2.5:7b"
+complex_model = "qwen2.5:7b"
+base_url = "http://<你的Ollama服务器IP>:11434"
+```
+
+---
+
+## 启动方式
+
+```bash
+# 命令行
+python -m examples.pc_agent.main
+
+# 网页（Streamlit）
+streamlit run examples/pc_agent/streamlit_app.py
+```
+
+---
+
+## 文件说明
 
 ```
 examples/pc_agent/
@@ -22,44 +85,14 @@ examples/pc_agent/
 ├── tools.py              # 3 个工具: 检测查询/导航发送/取消导航
 ├── main.py               # 命令行交互入口
 ├── streamlit_app.py      # Streamlit 网页前端
-├── test_connection.py    # 通信测试脚本
-├── test_raw_sub.py       # 原始订阅测试
-├── mock_orin.py          # Orin 模拟器
-├── REPORT.md             # 技术文档
-└── README.md             # 使用说明
+├── test_connection.py    # 通信测试
+├── test_raw_sub.py       # 原生订阅测试
+├── mock_orin.py          # Orin 模拟器（无真机时开发用）
+├── REPORT.md             # 完整技术文档
+└── README.md
 ```
 
-## 快速开始
-
-### 1. 前置条件
-
-- ROS 2 Humble/Jazzy + RAI 框架
-- Orin 端: Votenet 检测 + Nav2 导航 + TF
-- 大模型: llama3.2 / qwen2.5:7b / gemma2:27b (Ollama)
-
-### 2. 配置模型
-
-编辑 `config.toml`:
-
-```toml
-[ollama]
-simple_model = "qwen2.5:7b"
-complex_model = "qwen2.5:7b"
-base_url = "http://<ollama服务器>:11434"
-```
-
-### 3. 启动
-
-```bash
-source /opt/ros/humble/setup.bash
-source setup_shell.sh
-
-# 命令行:
-python -m examples.pc_agent.main
-
-# 或网页:
-streamlit run examples/pc_agent/streamlit_app.py
-```
+---
 
 ## 使用示例
 
