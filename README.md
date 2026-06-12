@@ -21,7 +21,6 @@ PC (LLM) ←→ ROS 2 DDS ←→ Orin (Votenet + Nav2)
 - ✅ 原生 Function Calling（qwen2.5:32b 支持）
 - ✅ TF 坐标自动变换 (rslidar → map)
 - ✅ Docker 一键部署到 Orin
-- ✅ CycloneDDS TCP 跨子网通信
 
 ---
 
@@ -72,20 +71,6 @@ base_url = "http://<Ollama服务器IP>:11434"
 ```
 
 推荐 `qwen2.5:32b`（支持原生 Function Calling）或 `gemma2:27b`（手动 ReAct 兼容）。
-
----
-
-## 跨子网通信
-
-如果 PC 和 Orin 不在同一子网，用 CycloneDDS TCP：
-
-```bash
-# PC 上
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI="file:///path/to/cyclone.xml"
-```
-
-配置文件 `cyclone.xml` 已包含在仓库中。
 
 ---
 
