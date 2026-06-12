@@ -82,14 +82,8 @@ class GetDetectionsTool(BaseTool):
     timeout_sec: float = Field(default=10.0)
 
     def _ensure_subscribed(self):
-        """确保已订阅话题（只订阅一次，后续复用）。
-
-        使用独立 rclpy 节点 + SingleThreadedExecutor 后台 spin，
-        绕过 RAI connector 的 executor 兼容性问题。
-        """
+        """确保已订阅话题（只订阅一次，复用 RAI connector 的 executor）。"""
         import threading
-        import rclpy
-        from rclpy.executors import SingleThreadedExecutor
         from vision_msgs.msg import Detection3DArray
 
         cache_key = self.topic
@@ -104,11 +98,9 @@ class GetDetectionsTool(BaseTool):
             }
             _detection_cache[cache_key] = cache_entry
 
-        # 创建独立节点
-        detect_node = rclpy.create_node("rai_detect_sub",
-            context=self.connector.node.context)
-        executor = SingleThreadedExecutor()
-        executor.add_node(detect_node)
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         def _on_detection(msg: Detection3DArray):
             with _detection_lock:
@@ -116,12 +108,21 @@ class GetDetectionsTool(BaseTool):
                 cache_entry["timestamp"] = time.time()
                 cache_entry["count"] += 1
 
-        detect_node.create_subscription(
-            Detection3DArray, self.topic, _on_detection, 10
+        self.connector.node.create_subscription(
+            Detection3DArray, self.topic, _on_detection, qos
         )
+        logger.info(f"已订阅 {self.topic} (connector node)，等待 DDS 发现...")
 
-        threading.Thread(target=executor.spin, daemon=True).start()
-        logger.info(f"已订阅 {self.topic} (独立节点)")
+        # 等待第一条消息
+        warm_start = time.time()
+        while time.time() - warm_start < 15:
+            with _detection_lock:
+                if cache_entry["payload"] is not None:
+                    logger.info(f"预热完成，已收到 {cache_entry['count']} 条")
+                    break
+            time.sleep(0.3)
+        else:
+            logger.warning(f"预热超时，将按需重试")
 
     @staticmethod
     def _parse_detection3d_array(payload) -> list[DetectionObject]:
