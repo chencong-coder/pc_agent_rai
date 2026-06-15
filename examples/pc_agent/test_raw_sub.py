@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""带 QoS 匹配的订阅测试"""
-import sys, time, threading
+"""订阅测试 — 用 rclpy 全局 spin"""
+import sys, time
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy
 from vision_msgs.msg import Detection3DArray
 
 
@@ -13,30 +11,21 @@ def main(topic="/detect_bbox3d", timeout=15.0):
     node = Node("test_detect")
 
     latest = []
-    event = threading.Event()
-
-    # 先试 RELIABLE
-    qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
     def cb(msg):
         latest.append(msg)
-        event.set()
 
-    node.create_subscription(Detection3DArray, topic, cb, qos)
+    node.create_subscription(Detection3DArray, topic, cb, 10)
+    print(f"⏳ 等待 {topic} (最长 {timeout}s)...")
 
-    executor = SingleThreadedExecutor()
-    executor.add_node(node)
-    t = threading.Thread(target=executor.spin, daemon=True)
-    t.start()
+    start = time.time()
+    while not latest and time.time() - start < timeout:
+        rclpy.spin_once(node, timeout_sec=0.2)
 
-    print(f"⏳ 等待 {topic} (最长 {timeout}s, QoS=BEST_EFFORT)...")
-    ok = event.wait(timeout)
-
-    executor.shutdown()
     node.destroy_node()
     rclpy.shutdown()
 
-    if not ok:
+    if not latest:
         print(f"\n✗ {timeout}s 内未收到消息")
         return 1
 

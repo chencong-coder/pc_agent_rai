@@ -79,21 +79,16 @@ class GetDetectionsTool(BaseTool):
     topic: str = Field(default="/detect_bbox3d")
     target_frame: str = Field(default="map", description="TF 变换目标坐标系")
     cache_max_age: float = Field(default=10.0, description="缓存有效时间(秒)")
-    timeout_sec: float = Field(default=10.0)
+    timeout_sec: float = Field(default=15.0)
 
     def _ensure_subscribed(self):
-        """直接创建 subscriber，不缓存，每次 _run 调用。"""
-        import threading
-        from rclpy.executors import SingleThreadedExecutor
+        import rclpy
         from vision_msgs.msg import Detection3DArray
 
-        # 创建独立节点 + executor（共享 connector 的 rclpy context）
-        import rclpy
-        node = rclpy.create_node("rai_detect_sub",
-            context=self.connector.node.context)
-        executor = SingleThreadedExecutor()
-        executor.add_node(node)
-
+        # 独立 rclpy 上下文 — 避免跟 connector 的 executor 冲突
+        if not rclpy.ok():
+            rclpy.init()
+        node = rclpy.create_node("rai_detect_sub")
         cache_entry = {"payload": None, "timestamp": 0.0, "count": 0}
 
         def _on_detection(msg: Detection3DArray):
@@ -102,21 +97,15 @@ class GetDetectionsTool(BaseTool):
             cache_entry["count"] += 1
 
         node.create_subscription(Detection3DArray, self.topic, _on_detection, 10)
-
-        spin_thread = threading.Thread(target=executor.spin, daemon=True)
-        spin_thread.start()
-
         logger.info(f"已创建订阅 {self.topic}，等待消息...")
 
-        # 等待
+        # spin_once 循环 — 跟 ros2 topic echo 一样
         warm_start = time.time()
         while time.time() - warm_start < self.timeout_sec:
+            rclpy.spin_once(node, timeout_sec=0.2)
             if cache_entry["payload"] is not None:
                 logger.info(f"收到 {cache_entry['count']} 条消息")
                 break
-            time.sleep(0.3)
-
-        executor.shutdown()
         node.destroy_node()
 
         return cache_entry
@@ -203,12 +192,35 @@ class GetDetectionsTool(BaseTool):
         return result
 
     def _run(self, object_class: Optional[str] = None) -> str:
-        cache_entry = self._ensure_subscribed()
+        # 直接用 test_raw_sub.py 的模式 — spin_once 循环
+        import rclpy
+        from vision_msgs.msg import Detection3DArray
 
-        payload = cache_entry.get("payload")
+        cache = []
+        node = rclpy.create_node(f"rai_detect_{int(time.time())}")
+
+        def cb(msg): cache.append(msg)
+        node.create_subscription(Detection3DArray, self.topic, cb, 10)
+
+        start = time.time()
+        payload = None
+        empty_count = 0
+        while time.time() - start < self.timeout_sec:
+            rclpy.spin_once(node, timeout_sec=0.2)
+            if cache:
+                msg = cache.pop(0)
+                if msg.detections:
+                    payload = msg
+                    break
+                else:
+                    empty_count += 1
+
+        node.destroy_node()
+
         if payload is None:
             return (
-                f"未收到检测结果（等待 {self.timeout_sec}s）。"
+                f"未收到检测结果（等待 {self.timeout_sec}s，"
+                f"收到 {empty_count} 个空帧）。"
                 f"请确认 Orin 的 VoteNet 正在发布 {self.topic}。"
             )
 
