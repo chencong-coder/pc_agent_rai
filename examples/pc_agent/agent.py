@@ -75,12 +75,6 @@ def create_pc_agent(
 
     llm = get_llm_model(model_type=model_type, vendor=vendor, streaming=True)
 
-    # 预热检测订阅
-    det_tool = tools_by_name.get("get_detections")
-    if det_tool:
-        det_tool._ensure_subscribed()
-        logger.info("检测订阅已预热")
-
     if verbose:
         model_id = getattr(llm, 'model_name', getattr(llm, 'model', 'unknown'))
         logger.info(f"LLM: {model_id}")

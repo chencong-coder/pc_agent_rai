@@ -82,47 +82,44 @@ class GetDetectionsTool(BaseTool):
     timeout_sec: float = Field(default=10.0)
 
     def _ensure_subscribed(self):
-        """确保已订阅话题（只订阅一次，复用 RAI connector 的 executor）。"""
+        """直接创建 subscriber，不缓存，每次 _run 调用。"""
         import threading
+        from rclpy.executors import SingleThreadedExecutor
         from vision_msgs.msg import Detection3DArray
 
-        cache_key = self.topic
-        with _detection_lock:
-            if cache_key in _detection_cache:
-                return
+        # 创建独立节点 + executor（共享 connector 的 rclpy context）
+        import rclpy
+        node = rclpy.create_node("rai_detect_sub",
+            context=self.connector.node.context)
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
 
-            cache_entry = {
-                "payload": None,
-                "timestamp": 0.0,
-                "count": 0,
-            }
-            _detection_cache[cache_key] = cache_entry
-
-        from rclpy.qos import QoSProfile, ReliabilityPolicy
-
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        cache_entry = {"payload": None, "timestamp": 0.0, "count": 0}
 
         def _on_detection(msg: Detection3DArray):
-            with _detection_lock:
-                cache_entry["payload"] = msg
-                cache_entry["timestamp"] = time.time()
-                cache_entry["count"] += 1
+            cache_entry["payload"] = msg
+            cache_entry["timestamp"] = time.time()
+            cache_entry["count"] += 1
 
-        self.connector.node.create_subscription(
-            Detection3DArray, self.topic, _on_detection, qos
-        )
-        logger.info(f"已订阅 {self.topic} (connector node)，等待 DDS 发现...")
+        node.create_subscription(Detection3DArray, self.topic, _on_detection, 10)
 
-        # 等待第一条消息
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+
+        logger.info(f"已创建订阅 {self.topic}，等待消息...")
+
+        # 等待
         warm_start = time.time()
-        while time.time() - warm_start < 15:
-            with _detection_lock:
-                if cache_entry["payload"] is not None:
-                    logger.info(f"预热完成，已收到 {cache_entry['count']} 条")
-                    break
+        while time.time() - warm_start < self.timeout_sec:
+            if cache_entry["payload"] is not None:
+                logger.info(f"收到 {cache_entry['count']} 条消息")
+                break
             time.sleep(0.3)
-        else:
-            logger.warning(f"预热超时，将按需重试")
+
+        executor.shutdown()
+        node.destroy_node()
+
+        return cache_entry
 
     @staticmethod
     def _parse_detection3d_array(payload) -> list[DetectionObject]:
@@ -206,35 +203,14 @@ class GetDetectionsTool(BaseTool):
         return result
 
     def _run(self, object_class: Optional[str] = None) -> str:
-        self._ensure_subscribed()
+        cache_entry = self._ensure_subscribed()
 
-        cache_key = self.topic
-        start = time.time()
-
-        # 等待缓存中有数据
-        while time.time() - start < self.timeout_sec:
-            with _detection_lock:
-                entry = _detection_cache.get(cache_key, {})
-                payload = entry.get("payload")
-
-            if payload is not None:
-                break
-            time.sleep(0.2)
-        else:
+        payload = cache_entry.get("payload")
+        if payload is None:
             return (
                 f"未收到检测结果（等待 {self.timeout_sec}s）。"
                 f"请确认 Orin 的 VoteNet 正在发布 {self.topic}。"
-                f"已收到 {_detection_cache.get(cache_key, {}).get('count', 0)} 条消息。"
             )
-
-        # 检查缓存新鲜度
-        with _detection_lock:
-            ts = _detection_cache[cache_key]["timestamp"]
-            payload = _detection_cache[cache_key]["payload"]
-
-        age = time.time() - ts
-        if age > self.cache_max_age:
-            logger.warning(f"检测缓存已过期 ({age:.1f}s > {self.cache_max_age}s)")
 
         detections = self._parse_detection3d_array(payload)
 
