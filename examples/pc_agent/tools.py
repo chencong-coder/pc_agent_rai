@@ -112,22 +112,32 @@ class GetDetectionsTool(BaseTool):
 
     @staticmethod
     def _parse_detection3d_array(payload) -> list[DetectionObject]:
+        import math
+
         detections = []
         for det in payload.detections:
             if det.results:
                 best = det.results[0]
+                score = float(best.hypothesis.score)
+                class_id = best.hypothesis.class_id.strip()
+                x = float(best.pose.pose.position.x)
+                y = float(best.pose.pose.position.y)
+                z = float(best.pose.pose.position.z)
+
+                # 过滤无效检测: score=0, class 为空, nan/inf 坐标
+                if score <= 0.0 or not class_id:
+                    continue
+                if math.isnan(x) or math.isinf(x):
+                    continue
+                if math.isnan(y) or math.isinf(y):
+                    continue
+                if math.isnan(z) or math.isinf(z):
+                    continue
+
                 detections.append(DetectionObject(
-                    class_name=best.hypothesis.class_id,
-                    x=float(best.pose.pose.position.x),
-                    y=float(best.pose.pose.position.y),
-                    z=float(best.pose.pose.position.z),
-                    confidence=float(best.hypothesis.score),
-                ))
-            elif hasattr(det, "bbox"):
-                pos = det.bbox.center.position
-                detections.append(DetectionObject(
-                    class_name="unknown",
-                    x=float(pos.x), y=float(pos.y), z=float(pos.z),
+                    class_name=class_id,
+                    x=x, y=y, z=z,
+                    confidence=score,
                 ))
         return detections
 
