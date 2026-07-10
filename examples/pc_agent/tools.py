@@ -34,11 +34,26 @@ from tf_transformations import quaternion_from_euler
 from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
 
+from .detect_socket_client import DetectBBox3DSocketClient
+
 logger = logging.getLogger(__name__)
 
 # 模块级检测缓存 — 持续订阅，每次 _run 只读缓存
 _detection_cache: dict = {}
 _detection_lock = Lock()
+_socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
+_socket_clients_lock = Lock()
+
+
+def _get_socket_client(host: str, port: int) -> DetectBBox3DSocketClient:
+    key = (host, port)
+    with _socket_clients_lock:
+        client = _socket_clients.get(key)
+        if client is None:
+            client = DetectBBox3DSocketClient(host=host, port=port)
+            client.start()
+            _socket_clients[key] = client
+        return client
 
 
 # ─── Data Models ──────────────────────────────────────────────────────────
@@ -63,8 +78,8 @@ class GetDetectionsToolInput(BaseModel):
 class GetDetectionsTool(BaseTool):
     """读取 Orin VoteNet 发布的 3D 室内检测结果。
 
-    使用原生 rclpy subscriber（不经过 RAI 的 receive_message），
-    持续监听 /detect_bbox3d，缓存最新消息。每次 LLM 调用时直接读缓存。
+    默认通过 TCP socket 读取 Orin Foxy 侧 bridge 发来的 JSON，
+    避免 Humble 容器直接订阅 Foxy ROS 2 话题。
     """
 
     name: str = "get_detections"
@@ -77,6 +92,9 @@ class GetDetectionsTool(BaseTool):
 
     connector: ROS2Connector = Field(..., exclude=True)
     topic: str = Field(default="/detect_bbox3d")
+    detection_source: str = Field(default="socket", description="socket 或 ros")
+    socket_host: str = Field(default="127.0.0.1")
+    socket_port: int = Field(default=8765)
     target_frame: str = Field(default="map", description="TF 变换目标坐标系")
     cache_max_age: float = Field(default=10.0, description="缓存有效时间(秒)")
     timeout_sec: float = Field(default=15.0)
@@ -142,6 +160,63 @@ class GetDetectionsTool(BaseTool):
         return detections
 
     @staticmethod
+    def _parse_socket_payload(payload: dict) -> list[DetectionObject]:
+        import math
+
+        detections = []
+        for det in payload.get("detections", []):
+            class_id = str(det.get("class_id", "")).strip()
+            score = float(det.get("score", 0.0) or 0.0)
+            center = det.get("center", {}) or {}
+
+            x = float(center.get("x", 0.0) or 0.0)
+            y = float(center.get("y", 0.0) or 0.0)
+            z = float(center.get("z", 0.0) or 0.0)
+
+            if score <= 0.0 or not class_id:
+                continue
+            if math.isnan(x) or math.isinf(x):
+                continue
+            if math.isnan(y) or math.isinf(y):
+                continue
+            if math.isnan(z) or math.isinf(z):
+                continue
+
+            detections.append(DetectionObject(
+                class_name=class_id,
+                x=x, y=y, z=z,
+                confidence=score,
+            ))
+        return detections
+
+    def _format_detections(
+        self,
+        detections: list[DetectionObject],
+        object_class: Optional[str] = None,
+    ) -> str:
+        if object_class:
+            detections = [
+                d for d in detections
+                if d.class_name.lower() == object_class.lower()
+            ]
+
+        if not detections:
+            msg = "当前未检测到任何目标物体。"
+            if object_class:
+                msg = f"当前未检测到类别为 '{object_class}' 的目标。"
+            return msg
+
+        label = f"（过滤: {object_class}）" if object_class else ""
+        lines = [f"检测到 {len(detections)} 个目标{label}:"]
+        for i, d in enumerate(detections, 1):
+            lines.append(
+                f"  {i}. {d.class_name} "
+                f"坐标({d.x:.2f}, {d.y:.2f}, {d.z:.2f}) "
+                f"置信度={d.confidence:.2f}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
     def _apply_transform(
         px: float, py: float, pz: float,
         qx: float, qy: float, qz: float, qw: float,
@@ -202,6 +277,30 @@ class GetDetectionsTool(BaseTool):
         return result
 
     def _run(self, object_class: Optional[str] = None) -> str:
+        if self.detection_source == "socket":
+            client = _get_socket_client(self.socket_host, self.socket_port)
+
+            payload = None
+            start = time.time()
+            while time.time() - start < self.timeout_sec:
+                payload = client.get_latest(max_age=self.cache_max_age)
+                if payload is not None:
+                    break
+                time.sleep(0.1)
+
+            if payload is None:
+                return (
+                    f"未收到 socket 检测结果（等待 {self.timeout_sec}s）。"
+                    f"请确认 Orin 上已运行 detect_bbox3d_socket_bridge，"
+                    f"并监听 {self.socket_host}:{self.socket_port}。"
+                )
+
+            detections = self._parse_socket_payload(payload)
+            source_frame = str(payload.get("frame_id", ""))
+            if source_frame:
+                detections = self._transform_detections(detections, source_frame)
+            return self._format_detections(detections, object_class)
+
         # 直接用 test_raw_sub.py 的模式 — spin_once 循环
         import rclpy
         from vision_msgs.msg import Detection3DArray

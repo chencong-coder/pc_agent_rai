@@ -94,6 +94,23 @@ def main():
         help="Votenet 检测结果话题 (默认: /detect_bbox3d)",
     )
     parser.add_argument(
+        "--detection-source",
+        default="socket",
+        choices=["socket", "ros"],
+        help="检测结果来源: socket 或 ros (默认: socket)",
+    )
+    parser.add_argument(
+        "--socket-host",
+        default="127.0.0.1",
+        help="检测 socket bridge 地址 (默认: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--socket-port",
+        type=int,
+        default=8765,
+        help="检测 socket bridge 端口 (默认: 8765)",
+    )
+    parser.add_argument(
         "--nav-action",
         default="navigate_to_pose",
         help="Nav2 导航 Action 名称 (默认: navigate_to_pose)",
@@ -135,12 +152,17 @@ def main():
     logger.info("正在初始化 PC Agent...")
     logger.info(f"  LLM Vendor: {args.vendor or 'config.toml 中配置'}")
     logger.info(f"  LLM Model: {args.model}")
+    logger.info(f"  检测来源: {args.detection_source}")
     logger.info(f"  检测话题: {args.detection_topic}")
+    logger.info(f"  检测 Socket: {args.socket_host}:{args.socket_port}")
     logger.info(f"  导航 Action: {args.nav_action}")
 
     try:
         agent, tools, connector = create_pc_agent(
             detection_topic=args.detection_topic,
+            detection_source=args.detection_source,
+            socket_host=args.socket_host,
+            socket_port=args.socket_port,
             nav_action_name=args.nav_action,
             frame_id=args.frame_id,
             target_frame=args.target_frame,

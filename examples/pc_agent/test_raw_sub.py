@@ -1,43 +1,57 @@
 #!/usr/bin/env python3
-"""订阅测试 — 用 rclpy 全局 spin"""
-import sys, time
-import rclpy
-from rclpy.node import Node
-from vision_msgs.msg import Detection3DArray
+"""Socket test for Orin /detect_bbox3d bridge."""
+
+import argparse
+import json
+import socket
+import sys
 
 
-def main(topic="/detect_bbox3d", timeout=15.0):
-    rclpy.init()
-    node = Node("test_detect")
+def main(host="127.0.0.1", port=8765, timeout=15.0):
+    print(f"等待 detect socket {host}:{port} (最长 {timeout}s)...")
 
-    latest = []
-
-    def cb(msg):
-        latest.append(msg)
-
-    node.create_subscription(Detection3DArray, topic, cb, 10)
-    print(f"⏳ 等待 {topic} (最长 {timeout}s)...")
-
-    start = time.time()
-    while not latest and time.time() - start < timeout:
-        rclpy.spin_once(node, timeout_sec=0.2)
-
-    node.destroy_node()
-    rclpy.shutdown()
-
-    if not latest:
-        print(f"\n✗ {timeout}s 内未收到消息")
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        print(f"\n连接失败: {exc}")
         return 1
 
-    msg = latest[0]
-    print(f"\n✓ 收到消息, frame_id={msg.header.frame_id}, detections={len(msg.detections)}")
-    for i, det in enumerate(msg.detections):
-        if det.results:
-            b = det.results[0]
-            p = b.pose.pose.position
-            print(f"    {i+1}. {b.hypothesis.class_id:10s} ({p.x:.2f},{p.y:.2f},{p.z:.2f}) conf={b.hypothesis.score:.2f}")
+    sock.settimeout(timeout)
+    with sock:
+        file_obj = sock.makefile("r", encoding="utf-8")
+        try:
+            line = file_obj.readline()
+        except OSError as exc:
+            print(f"\n读取失败: {exc}")
+            return 1
+
+    if not line:
+        print(f"\n{timeout}s 内未收到 socket 消息")
+        return 1
+
+    msg = json.loads(line)
+    detections = msg.get("detections", [])
+    print(
+        f"\n收到消息, frame_id={msg.get('frame_id', '')}, "
+        f"detections={len(detections)}"
+    )
+
+    for i, det in enumerate(detections, 1):
+        center = det.get("center", {})
+        print(
+            f"    {i}. {det.get('class_id', ''):12s} "
+            f"({center.get('x', 0.0):.2f},"
+            f"{center.get('y', 0.0):.2f},"
+            f"{center.get('z', 0.0):.2f}) "
+            f"conf={det.get('score', 0.0):.2f}"
+        )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--timeout", type=float, default=15.0)
+    args = parser.parse_args()
+    sys.exit(main(args.host, args.port, args.timeout))

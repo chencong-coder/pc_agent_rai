@@ -44,6 +44,9 @@ SYSTEM_PROMPT = """你是一个无人车控制助手。根据用户指令使用�
 
 def create_pc_agent(
     detection_topic: str = "/detect_bbox3d",
+    detection_source: str = "socket",
+    socket_host: str = "127.0.0.1",
+    socket_port: int = 8765,
     nav_action_name: str = "navigate_to_pose",
     frame_id: str = "map",
     target_frame: str = "map",
@@ -60,6 +63,9 @@ def create_pc_agent(
         GetDetectionsTool(
             connector=connector,
             topic=detection_topic,
+            detection_source=detection_source,
+            socket_host=socket_host,
+            socket_port=socket_port,
             target_frame=target_frame,
             timeout_sec=detection_timeout,
         ),
