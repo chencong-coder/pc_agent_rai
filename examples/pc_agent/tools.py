@@ -23,13 +23,13 @@ PC Agent Tools - 用于 PC 端与大模型交互的 ROS 2 工具
 
 import json
 import logging
+import math
 import time
 from threading import Lock
 from typing import Optional, Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
-from tf_transformations import quaternion_from_euler
 
 from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
@@ -43,6 +43,11 @@ _detection_cache: dict = {}
 _detection_lock = Lock()
 _socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
 _socket_clients_lock = Lock()
+
+
+def _quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:
+    half_yaw = yaw * 0.5
+    return 0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)
 
 
 def _get_socket_client(host: str, port: int) -> DetectBBox3DSocketClient:
@@ -130,8 +135,6 @@ class GetDetectionsTool(BaseTool):
 
     @staticmethod
     def _parse_detection3d_array(payload) -> list[DetectionObject]:
-        import math
-
         detections = []
         for det in payload.detections:
             if det.results:
@@ -161,8 +164,6 @@ class GetDetectionsTool(BaseTool):
 
     @staticmethod
     def _parse_socket_payload(payload: dict) -> list[DetectionObject]:
-        import math
-
         detections = []
         for det in payload.get("detections", []):
             class_id = str(det.get("class_id", "")).strip()
@@ -395,7 +396,7 @@ class NavigateToCoordinatesTool(BaseTool):
             target = "/" + target
 
         try:
-            quat = quaternion_from_euler(0, 0, yaw)
+            quat = _quaternion_from_yaw(yaw)
             goal = {
                 "pose": {
                     "header": {
