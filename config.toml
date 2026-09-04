@@ -13,8 +13,8 @@ embeddings_model = "amazon.titan-embed-text-v1"
 region_name = "us-east-1"
 
 [openai]
-simple_model = "deepseek-chat"
-complex_model = "deepseek-chat"
+simple_model = "deepseek-v4-pro"
+complex_model = "deepseek-v4-pro"
 embeddings_model = "text-embedding-ada-002"
 base_url = "https://api.deepseek.com"
 
