@@ -13,10 +13,11 @@
 # limitations under the License.
 
 """
-PC Agent — 原生 Function Calling（qwen2.5:32b 支持）
+PC Agent — 原生 Function Calling（DeepSeek OpenAI 兼容接口）
 """
 
 import logging
+import os
 from typing import List
 
 from langchain_core.tools import BaseTool
@@ -30,6 +31,14 @@ from .tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_llm_credentials() -> None:
+    """Map a DeepSeek-specific key to the variable used by RAI's OpenAI adapter."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+        if deepseek_key:
+            os.environ["OPENAI_API_KEY"] = deepseek_key
 
 SYSTEM_PROMPT = """你是一个无人车控制助手。根据用户指令使用工具完成任务。
 
@@ -79,6 +88,9 @@ def create_pc_agent(
 
     tools_by_name = {t.name: t for t in tools}
 
+    # RAI's OpenAI adapter reads OPENAI_API_KEY. DeepSeek uses the same
+    # protocol, so accept DEEPSEEK_API_KEY without exposing it in config.toml.
+    _prepare_llm_credentials()
     llm = get_llm_model(model_type=model_type, vendor=vendor, streaming=True)
 
     if verbose:

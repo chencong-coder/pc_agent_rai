@@ -1,6 +1,9 @@
 [vendor]
-simple_model = "ollama"
-complex_model = "ollama"
+# DeepSeek exposes an OpenAI-compatible Chat Completions API.
+simple_model = "openai"
+complex_model = "openai"
+# DeepSeek does not provide an embeddings endpoint. The PC Agent does not
+# initialize embeddings, so keep this fallback separate from the chat model.
 embeddings_model = "ollama"
 
 [aws]
@@ -10,16 +13,16 @@ embeddings_model = "amazon.titan-embed-text-v1"
 region_name = "us-east-1"
 
 [openai]
-simple_model = "gpt-4o-mini"
-complex_model = "gpt-4o"
+simple_model = "deepseek-chat"
+complex_model = "deepseek-chat"
 embeddings_model = "text-embedding-ada-002"
-base_url = "https://api.openai.com/v1/"
+base_url = "https://api.deepseek.com"
 
 [ollama]
 simple_model = "qwen2.5:32b"
 complex_model = "qwen2.5:32b"
 embeddings_model = "mxbai-embed-large:latest"
-base_url = "http://10.64.24.93:11434"
+base_url = "http://localhost:11434"
 
 [google]
 simple_model = "gemini-3-flash"

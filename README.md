@@ -12,13 +12,13 @@ PC (LLM) ←→ ROS 2 DDS ←→ Orin (Votenet + Nav2)
    └─ 执行 ROS 2 通信         └─ 零代码改动
 ```
 
-**LLM 做决策，Agent 做执行，Orin 做动作。** 支持原生 Function Calling（qwen2.5:32b）。
+**LLM 做决策，Agent 做执行，Orin 做动作。** 默认使用支持工具调用的 DeepSeek `deepseek-chat`。
 
 ## 特性
 
 - ✅ 文字 + 🎤 语音双输入（RAI ASR 语音识别）
 - ✅ Streamlit 网页前端
-- ✅ 原生 Function Calling（qwen2.5:32b 支持）
+- ✅ DeepSeek OpenAI 兼容接口 + 原生工具调用
 - ✅ TF 坐标自动变换 (rslidar → map)
 - ✅ Docker 一键部署到 Orin
 
@@ -33,8 +33,12 @@ cp tmp_pc/examples/pc_agent examples/pc_agent -r
 cp tmp_pc/config.toml ./
 rm -rf tmp_pc
 source setup_shell.sh
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
 
 # 文字输入
+python -m examples.pc_agent.main
+
+# 网页输入
 streamlit run examples/pc_agent/streamlit_app.py
 
 # 语音输入（需安装 ASR）
@@ -54,6 +58,7 @@ cp tmp/config.toml ./
 rm -rf tmp
 colcon build --symlink-install
 source setup_shell.sh
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
 streamlit run examples/pc_agent/streamlit_app.py
 ```
 
@@ -61,16 +66,30 @@ streamlit run examples/pc_agent/streamlit_app.py
 
 ## 配置模型
 
-编辑 `config.toml`：
+仓库中的 `config.toml` 已切换到 DeepSeek。运行前只需要设置 API Key：
 
-```toml
-[ollama]
-simple_model = "qwen2.5:32b"
-complex_model = "qwen2.5:32b"
-base_url = "http://<Ollama服务器IP>:11434"
+```bash
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
 ```
 
-推荐 `qwen2.5:32b`（支持原生 Function Calling）或 `gemma2:27b`（手动 ReAct 兼容）。
+RAI 的 OpenAI 适配器读取 `OPENAI_API_KEY`，代码会自动把
+`DEEPSEEK_API_KEY` 映射过去；也可以直接设置 `OPENAI_API_KEY`。
+
+关键配置如下：
+
+```toml
+[vendor]
+simple_model = "openai"
+complex_model = "openai"
+
+[openai]
+simple_model = "deepseek-chat"
+complex_model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
+```
+
+DeepSeek 当前不提供 embeddings 接口，因此 `embeddings_model` 保留为
+Ollama 备用配置；PC Agent 本身不会初始化 embeddings。
 
 ---
 
@@ -79,7 +98,9 @@ base_url = "http://<Ollama服务器IP>:11434"
 ```bash
 cd pc_agent_rai
 docker build -t pc-agent -f docker/pc_agent.dockerfile .
-docker run -d --name pc-agent --network=host --restart=always pc-agent
+docker run -d --name pc-agent --network=host --restart=always \
+  -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+  pc-agent
 ```
 
 PC 浏览器访问: `http://<orin-ip>:8501`

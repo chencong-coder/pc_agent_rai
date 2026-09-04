@@ -17,8 +17,8 @@
 | PC ↔ Orin ROS 2 通信 | ✓ 已打通 |
 | VoteNet 3D 检测数据接收 | ✓ 持续订阅可用 |
 | TF 坐标变换 (rslidar→map) | ✓ 自动转换 |
-| LLM 指令解析 (Ollama llama3.2) | ✓ ReAct Agent |
-| Nav2 导航 (Action 调用) | ✓ 预留接口 |
+| LLM 指令解析 (DeepSeek deepseek-chat) | ✓ ReAct Agent |
+| Nav2 导航 (Action 调用) | ✓ 已完成接口联调 |
 | 交互式命令行界面 | ✓ 可用 |
 
 ---
@@ -29,7 +29,7 @@
 ┌─────────────────────────────────────────────────────────┐
 │  PC (决策层) - 你的笔记本电脑                              │
 │                                                         │
-│  自然语言输入 → ReAct Agent → Ollama (llama3.2)           │
+│  自然语言输入 → ReAct Agent → DeepSeek (deepseek-chat)     │
 │         │                                               │
 │         ├─ get_detections (读 Orin 检测)                  │
 │         ├─ navigate_to_coordinates (发导航目标)            │
@@ -43,7 +43,7 @@
 │  Orin (执行层) - 小车的 Jetson Orin                       │
 │                                                         │
 │  VoteNet 3D检测 ──→ /detect_bbox3d (持续发布, ~0.4Hz)    │
-│  TF 变换         ──→ /tf (rslidar→turtle_bot→odom→map)  │
+│  TF 变换         ──→ /tf (rslidar→velodyne→base_link→odom→map) │
 │  Nav2 导航       ←── /navigate_to_pose (Action Server)   │
 │                                                         │
 │  Orin 端零代码改动，原样运行                                │
@@ -66,7 +66,7 @@
 
 ```
 ①  用户输入 "找床"
-②  Agent 将 [系统提示词 + "找床"] 发给 Ollama
+②  Agent 将 [系统提示词 + "找床"] 发给 DeepSeek
 ③  LLM 决策 → 输出: { tool: "get_detections", args: {} }
 ④  Agent 从检测缓存中读取最新一帧 VoteNet 数据
     (缓存由独立 subscriber 持续更新，无需每次请求 Orin)
@@ -115,7 +115,7 @@ examples/pc_agent/
 | 检测订阅 | 独立 rclpy 节点 + SingleThreadedExecutor | 绕过 RAI connector QoS 兼容问题 |
 | TF 变换 | connector.get_transform("map", "rslidar") | 纯数学旋转+平移，无外部依赖 |
 | 消息解析 | 原生 vision_msgs.msg | 匹配 VoteNet 标准输出 |
-| LLM 框架 | LangGraph ReAct + Ollama | RAI 内置，开箱即用 |
+| LLM 框架 | LangGraph ReAct + DeepSeek OpenAI 兼容接口 | RAI 内置，支持工具调用 |
 | 导航 | Nav2 Action Client | 标准 ROS 2 接口 |
 
 ---
@@ -197,16 +197,16 @@ examples/pc_agent/
 | Detection3DArray 解析 (类名+坐标+置信度) | ✓ |
 | TF 坐标变换 rslidar→map | ✓ |
 | LLM ReAct Agent 指令解析 | ✓ |
-| Nav2 导航 Action 调用接口 | ✓ (预留，待 Nav2 启动后测试) |
+| Nav2 导航 Action 调用接口 | ✓ (已通过 `/navigate_to_pose` 验证) |
 | 交互式命令行 | ✓ |
 
 ### 待完成
 
 | 事项 | 说明 |
 |------|------|
-| Nav2 联调 | Orin 启动 Nav2 后测试完整导航链路 |
+| Nav2 联调 | 已完成基础目标发送与底盘控制验证 |
 | TF 变换端到端验证 | 对比 rslidar 坐标和 map 坐标是否正确 |
-| Llama3.2 性能评估 | 确认推理速度和指令理解准确率 |
+| DeepSeek 性能评估 | 继续记录工具调用延迟和指令理解准确率 |
 | 异常处理完善 | 网络断开、VoteNet 崩溃等场景 |
 
 ---
@@ -217,7 +217,7 @@ examples/pc_agent/
 
 ```bash
 # 确保以下正在运行:
-#   VoteNet  → /detect_bbox3d
+#   VoteNet  → /detect_bbox3d → socket bridge :8765
 #   TF       → /tf (rslidar→map)
 #   Nav2     → /navigate_to_pose (导航时需启动)
 ```
@@ -228,8 +228,15 @@ examples/pc_agent/
 cd ~/Desktop/rai-main
 source /opt/ros/humble/setup.bash
 source setup_shell.sh
+export ROS_DOMAIN_ID=0
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
 python -m examples.pc_agent.main
 ```
+
+默认配置使用 `deepseek-chat`。RAI 的 OpenAI 适配器读取
+`OPENAI_API_KEY`，PC Agent 会自动将 `DEEPSEEK_API_KEY` 映射为该变量。
+如果 Agent 与 bridge 不在同一台机器，需要启动时增加
+`--socket-host <orin-ip> --socket-port 8765`。
 
 ### 交互示例
 

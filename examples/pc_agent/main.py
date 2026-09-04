@@ -24,8 +24,8 @@ PC Agent 主程序 - 交互式命令行界面
 依赖:
     - ROS 2 (Jazzy/Humble) 已 source
     - RAI 框架已安装 (uv sync)
-    - config.toml 已配置 LLM (Ollama/OpenAI/etc.)
-    - Orin 端: VOTENET 检测发布到 /detext_bbox3d
+    - config.toml 已配置 LLM (默认 DeepSeek/OpenAI 兼容接口)
+    - Orin 端: VoteNet 检测发布到 /detect_bbox3d 或 socket bridge
     - Orin 端: Nav2 导航运行中
 
 退出: 输入 'quit' 或 'exit' 或按 Ctrl+C

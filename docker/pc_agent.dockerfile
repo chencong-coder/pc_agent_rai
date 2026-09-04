@@ -15,6 +15,7 @@ RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key | \
     ros-humble-ros-base \
     ros-humble-vision-msgs \
     ros-humble-nav2-msgs \
+    ros-humble-tf-transformations \
     python3-colcon-common-extensions \
     python3-vcstool \
     && rm -rf /var/lib/apt/lists/*

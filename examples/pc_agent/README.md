@@ -1,106 +1,133 @@
 # PC Agent - RAI 自然语言控制示例
 
+PC Agent 使用 DeepSeek 理解中文指令，通过 ROS 2 工具读取 VoteNet 检测结果并调用 Orin 上的 Nav2，让小车执行检测、导航和停止操作。
+
 ## 架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  PC (你的电脑)                                           │
-│                                                         │
-│  你 → 输入文字 → LLM (llama3.2) → ReAct Agent           │
-│                      ↓                                  │
-│            ┌────────┴────────┐                          │
-│            ↓                 ↓                          │
-│    get_detections    navigate_to_coordinates            │
-│        (订阅)              (Action)                     │
-└──────────┬──────────────────┬───────────────────────────┘
-           │   ROS 2 DDS      │
-           ↓                  ↓
-┌──────────────────────────────────────────────────────────┐
-│  Orin (小车)                                             │
-│                                                          │
-│  YOLO 目标检测 ──→ /detection_result                     │
-│  Nav2 导航     ←── /navigate_to_pose                     │
-│                                                          │
-│  不需要写任何额外代码！                                    │
-└──────────────────────────────────────────────────────────┘
+PC / RAI Agent
+  用户指令 -> DeepSeek (OpenAI 兼容接口)
+                  |
+                  +-- get_detections -------- TCP socket -------- Orin VoteNet bridge
+                  +-- navigate_to_coordinates ROS 2 Action ----- Orin Nav2
+                  +-- cancel_navigation ------ ROS 2 Action ----- Orin Nav2
 ```
 
 ## 前置条件
 
-1. ROS 2 已安装并 source
-2. RAI 框架已构建
-3. `config.toml` 已配置 LLM（Ollama 或其它）
-4. Orin 端：YOLO 发布 `/detection_result`，Nav2 运行中
+1. 已安装并 source ROS 2 和 RAI。
+2. `config.toml` 已放在 RAI 工作空间根目录（本仓库版本默认使用 DeepSeek）。
+3. 已设置 DeepSeek API Key：
 
-## 快速开始
+   ```bash
+   export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+   ```
 
-### Step 1: 启动 Orin 模拟器（无真机时）
+   RAI 的 OpenAI 适配器使用 `OPENAI_API_KEY`。PC Agent 会自动完成
+   `DEEPSEEK_API_KEY -> OPENAI_API_KEY` 映射，也可以直接设置
+   `OPENAI_API_KEY`。
 
-```bash
-# 终端1: 启动模拟检测发布
-python examples/pc_agent/mock_orin.py
+4. Orin 上 VoteNet 正在发布 `/detect_bbox3d`，并运行 socket bridge。
+5. Orin 上 Nav2 已启动，`/navigate_to_pose` action server 可用。
+
+## 配置模型
+
+`config.toml` 中的聊天模型配置为：
+
+```toml
+[vendor]
+simple_model = "openai"
+complex_model = "openai"
+
+[openai]
+simple_model = "deepseek-chat"
+complex_model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
 ```
 
-### Step 2: 启动 PC Agent
+DeepSeek 不提供 embeddings 接口，因此仓库把 embeddings vendor 保留为
+Ollama 备用配置；本示例不会初始化 embeddings。
+
+## 启动
+
+### Orin：VoteNet socket bridge
 
 ```bash
-# 终端2: 启动 Agent
+source /opt/ros/foxy/setup.bash
+source ~/mm3d_ws/install/setup.bash
+ros2 run mmdet3d_ros2 detect_bbox3d_socket_bridge
+```
+
+bridge 默认监听 `0.0.0.0:8765`，需要保持该终端运行。
+
+### PC 或 RAI 容器：启动 Agent
+
+在 RAI 工作空间根目录执行：
+
+```bash
+source /opt/ros/humble/setup.bash
 source setup_shell.sh
-python -m examples.pc_agent.main
+export ROS_DOMAIN_ID=0
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+
+python -m examples.pc_agent.main \
+  --detection-source socket \
+  --socket-host <orin-ip> \
+  --socket-port 8765 \
+  --frame-id map \
+  --target-frame map
 ```
 
-### Step 3: 输入指令
+如果 Agent 和 bridge 位于同一台机器并使用 host network，
+`--socket-host 127.0.0.1` 即可。跨机器运行时必须填写 Orin 的实际 IP。
 
-```
-🧑 你: 周围有什么？
-🤖 Agent: (调用 get_detections) → 检测到: 2把椅子, 1张桌子, 2个人...
+也可以启动 Streamlit：
 
-🧑 你: 找椅子
-🤖 Agent: (调用 get_detections, 获取椅子坐标, 调用 navigate_to_coordinates)
-         导航指令已发送，目标位置 x=1.50m, y=2.00m
-
-🧑 你: 停下
-🤖 Agent: (调用 cancel_navigation) → 导航任务已取消
+```bash
+streamlit run examples/pc_agent/streamlit_app.py
 ```
 
-## 支持的命令示例
+### Docker
+
+```bash
+docker build -t pc-agent -f docker/pc_agent.dockerfile .
+docker run -d --name pc-agent --network=host --restart=always \
+  -e DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+  pc-agent
+```
+
+浏览器访问 `http://<主机IP>:8501`。
+
+## 指令示例
 
 | 用户输入 | Agent 行为 |
-|---------|-----------|
-| "周围有什么" | 调用 get_detections 获取检测结果 |
-| "找椅子" | 检测→找到椅子坐标→导航到椅子 |
-| "去桌子那里" | 检测→找到桌子坐标→导航到桌子 |
-| "找人" | 检测→找到人→导航到人 |
-| "停下" / "停止" | 取消导航 |
+|---|---|
+| `周围有什么` | 获取并列出当前 VoteNet 检测结果 |
+| `找椅子` | 获取椅子坐标，然后调用 Nav2 导航 |
+| `去桌子那里` | 获取桌子坐标，然后调用 Nav2 导航 |
+| `停下` | 取消当前导航任务 |
 
-## 配置参数
+导航坐标必须来自检测结果或用户提供的 `map` 坐标，Agent 不应编造坐标。
 
-```bash
-python -m examples.pc_agent.main \
-  --detection-topic /detection_result \  # Orin 检测话题
-  --nav-action navigate_to_pose \        # Nav2 Action 名
-  --frame-id map \                       # 导航坐标系
-  --model complex_model \                # LLM 模型
-  --vendor ollama \                      # LLM 供应商
-  --timeout 3.0                          # 检测超时
+## 命令行参数
+
+```text
+--detection-source {socket,ros}  检测来源，默认 socket
+--socket-host HOST               bridge 地址，默认 127.0.0.1
+--socket-port PORT               bridge 端口，默认 8765
+--nav-action NAME                Nav2 action，默认 navigate_to_pose
+--frame-id FRAME                 导航坐标系，默认 map
+--target-frame FRAME             检测结果转换目标坐标系，默认 map
+--model {simple_model,complex_model}
+--vendor openai                 覆盖 config.toml 中的 vendor
+--timeout SECONDS                检测等待时间，默认 10
 ```
 
-## Orin 端检测格式
+直接使用 ROS 2 检测话题时，可将 `--detection-source` 改为 `ros`，并确保
+PC 端安装了 `vision_msgs` 且 ROS 2 DDS 网络发现正常。
 
-`/detection_result` 话题使用 `std_msgs/String`，JSON 格式：
+## 数据与坐标
 
-```json
-{
-  "detections": [
-    {"class": "chair", "x": 1.2, "y": 3.4, "z": 0.0, "confidence": 0.92},
-    {"class": "person", "x": 2.1, "y": 1.8, "z": 0.0, "confidence": 0.87}
-  ],
-  "timestamp": 1712345678.9
-}
-```
-
-## 工作原理
-
-1. **ReAct Agent 循环**: LLM 收到指令 → 思考需要什么工具 → 调用工具 → 观察结果 → 继续思考或回复
-2. **工具共享 ROS 2 Connector**: 所有工具共享同一个 `ROS2Connector` 实例（同一个 ROS 2 节点）
-3. **无状态执行**: 每条指令独立执行，不依赖历史上下文
+socket bridge 发送逐行 JSON。每帧至少包含 `frame_id` 和 `detections`，检测项
+包含 `class_id`、`score` 和 `center.x/y/z`。当 `frame_id` 不是 `map` 时，Agent
+通过 TF 将坐标转换到 `--target-frame`，再把结果交给导航工具。
