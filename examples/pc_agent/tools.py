@@ -367,20 +367,32 @@ class GetDetectionsTool(BaseTool):
 # ─── Tool: 发送导航目标 ──────────────────────────────────────────────────
 
 class NavigateToCoordinatesToolInput(BaseModel):
-    x: float = Field(description="目标 x 坐标 (m)")
-    y: float = Field(description="目标 y 坐标 (m)")
-    z: float = Field(default=0.0, description="目标 z 坐标 (m)")
-    yaw: float = Field(default=0.0, description="朝向 (rad), 0=正前方")
+    x: float = Field(
+        description="map 坐标系中的目标 x 坐标，单位 m。用户直接给出的 x 可直接使用。"
+    )
+    y: float = Field(
+        description="map 坐标系中的目标 y 坐标，单位 m。用户直接给出的 y 可直接使用。"
+    )
+    z: float = Field(
+        default=0.0,
+        description="目标 z 坐标，二维 Nav2 会自动固定为 0，通常不要填写。",
+    )
+    yaw: float = Field(
+        default=0.0,
+        description="目标朝向，单位 rad；用户未提供朝向时使用 0。",
+    )
 
 
 class NavigateToCoordinatesTool(BaseTool):
-    """向 Orin Nav2 发送导航目标。"""
+    """向 Orin Nav2 发送 map 坐标导航目标。"""
 
     name: str = "navigate_to_coordinates"
     description: str = (
-        "控制小车导航到指定地图坐标。"
-        "参数: x(前/m), y(左/m), z(高/m), yaw(朝向/rad)。"
-        "先通过 get_detections 获取目标坐标，再用此工具导航。"
+        "控制小车导航到指定的 map 坐标。"
+        "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
+        "参数为 x(m)、y(m)、可选 yaw(rad)；z 会被二维 Nav2 固定为 0。"
+        "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
+        "{x: -4.2, y: 2.97, yaw: 0}。"
     )
     args_schema: Type[NavigateToCoordinatesToolInput] = (
         NavigateToCoordinatesToolInput
@@ -389,22 +401,34 @@ class NavigateToCoordinatesTool(BaseTool):
     connector: ROS2Connector = Field(..., exclude=True)
     frame_id: str = Field(default="map")
     action_name: str = Field(default="/navigate_to_pose")
+    action_timeout_sec: float = Field(
+        default=10.0,
+        description="等待 Nav2 Action Server 和目标接受的最长时间(秒)",
+    )
 
     def _run(self, x: float, y: float, z: float = 0.0, yaw: float = 0.0) -> str:
-        target = self.action_name
+        values = (x, y, z, yaw)
+        if not all(math.isfinite(float(value)) for value in values):
+            return "导航失败: x、y、z、yaw 必须是有限数字。"
+        if not math.isfinite(self.action_timeout_sec) or self.action_timeout_sec <= 0:
+            return "导航失败: Action 等待时间必须大于 0 秒。"
+
+        target = self.action_name.strip()
         if not target.startswith("/"):
             target = "/" + target
+        frame_id = self.frame_id.strip() or "map"
 
         try:
             quat = _quaternion_from_yaw(yaw)
             goal = {
                 "pose": {
                     "header": {
-                        "frame_id": self.frame_id,
+                        "frame_id": frame_id,
                         "stamp": self.connector.node.get_clock().now().to_msg(),
                     },
                     "pose": {
-                        "position": {"x": x, "y": y, "z": z},
+                        # Nav2 是二维导航，检测框的高度不能作为目标高度。
+                        "position": {"x": x, "y": y, "z": 0.0},
                         "orientation": {"x": quat[0], "y": quat[1], "z": quat[2], "w": quat[3]},
                     },
                 }
@@ -415,11 +439,13 @@ class NavigateToCoordinatesTool(BaseTool):
                 action_data=msg,
                 target=target,
                 msg_type="nav2_msgs/action/NavigateToPose",
+                timeout_sec=self.action_timeout_sec,
             )
 
             return (
                 f"导航指令已发送 (ID: {action_id})。\n"
-                f"目标: x={x:.2f}m, y={y:.2f}m, z={z:.2f}m, yaw={yaw:.2f}rad\n"
+                f"目标({frame_id}): x={x:.2f}m, y={y:.2f}m, z=0.00m, "
+                f"yaw={yaw:.2f}rad\n"
                 f"小车正在前往目标..."
             )
         except Exception as e:
