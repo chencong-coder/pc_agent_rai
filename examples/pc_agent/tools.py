@@ -71,6 +71,10 @@ class DetectionObject(BaseModel):
     confidence: float = Field(default=0.0)
 
 
+class DetectionTransformError(RuntimeError):
+    """Raised when a detection cannot be converted into the navigation frame."""
+
+
 # ─── Tool: 获取检测结果 ───────────────────────────────────────────────────
 
 class GetDetectionsToolInput(BaseModel):
@@ -91,7 +95,7 @@ class GetDetectionsTool(BaseTool):
     description: str = (
         "获取小车 VoteNet 检测到的周围物体及其 3D 坐标。"
         "可选参数 object_class 按类别过滤（如 'chair'）。"
-        "返回物体类别、地图坐标(x,y,z)、置信度。"
+        "仅在检测坐标成功转换到 map 后返回物体类别、地图坐标(x,y,z)、置信度。"
     )
     args_schema: Type[GetDetectionsToolInput] = GetDetectionsToolInput
 
@@ -194,6 +198,7 @@ class GetDetectionsTool(BaseTool):
         self,
         detections: list[DetectionObject],
         object_class: Optional[str] = None,
+        coordinate_frame: str = "map",
     ) -> str:
         if object_class:
             detections = [
@@ -208,14 +213,39 @@ class GetDetectionsTool(BaseTool):
             return msg
 
         label = f"（过滤: {object_class}）" if object_class else ""
-        lines = [f"检测到 {len(detections)} 个目标{label}:"]
+        lines = [
+            f"检测到 {len(detections)} 个目标{label}"
+            f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:"
+        ]
         for i, d in enumerate(detections, 1):
             lines.append(
                 f"  {i}. {d.class_name} "
-                f"坐标({d.x:.2f}, {d.y:.2f}, {d.z:.2f}) "
+                f"{coordinate_frame}坐标({d.x:.2f}, {d.y:.2f}, {d.z:.2f}) "
                 f"置信度={d.confidence:.2f}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_frame_id(frame_id: object) -> str:
+        return str(frame_id or "").strip().lstrip("/")
+
+    def _target_frame_name(self) -> str:
+        return self._normalize_frame_id(self.target_frame) or "map"
+
+    def _format_transform_error(
+        self, source_frame: str, error: Exception
+    ) -> str:
+        source = self._normalize_frame_id(source_frame) or "未知"
+        target = self._target_frame_name()
+        logger.error(
+            f"检测坐标无法从 {source} 转换到 {target}: {error}"
+        )
+        return (
+            f"检测结果当前属于 {source} 坐标系，未能转换为 {target} 坐标系。"
+            "本次不返回坐标，避免把激光雷达坐标误当成 Nav2 目标。"
+            f"请确认 AMCL 已完成初始定位，并检查: "
+            f"ros2 run tf2_ros tf2_echo {target} {source}"
+        )
 
     @staticmethod
     def _apply_transform(
@@ -241,21 +271,27 @@ class GetDetectionsTool(BaseTool):
         self, detections: list[DetectionObject], source_frame: str
     ) -> list[DetectionObject]:
         """把检测坐标从 source_frame 变换到 target_frame"""
-        if source_frame == self.target_frame:
+        source_frame = self._normalize_frame_id(source_frame)
+        target_frame = self._target_frame_name()
+        if not source_frame:
+            raise DetectionTransformError("检测消息缺少 header.frame_id")
+
+        if source_frame == target_frame:
             return detections  # 同坐标系，不用变
 
         try:
             tf = self.connector.get_transform(
-                target_frame=self.target_frame,
+                target_frame=target_frame,
                 source_frame=source_frame,
                 timeout_sec=3.0,
             )
         except Exception as e:
             logger.warning(
-                f"TF 变换 {source_frame}→{self.target_frame} 失败: {e}，"
-                f"返回原始坐标"
+                f"TF 变换 {source_frame}→{target_frame} 失败: {e}"
             )
-            return detections
+            raise DetectionTransformError(
+                f"TF 变换 {source_frame}→{target_frame} 失败"
+            ) from e
 
         q = tf.transform.rotation
         t = tf.transform.translation
@@ -273,7 +309,7 @@ class GetDetectionsTool(BaseTool):
                 confidence=det.confidence,
             ))
         logger.info(
-            f"TF: {len(result)} 个目标 {source_frame}→{self.target_frame}"
+            f"TF: {len(result)} 个目标 {source_frame}→{target_frame}"
         )
         return result
 
@@ -297,10 +333,16 @@ class GetDetectionsTool(BaseTool):
                 )
 
             detections = self._parse_socket_payload(payload)
-            source_frame = str(payload.get("frame_id", ""))
-            if source_frame:
+            source_frame = self._normalize_frame_id(payload.get("frame_id", ""))
+            try:
                 detections = self._transform_detections(detections, source_frame)
-            return self._format_detections(detections, object_class)
+            except DetectionTransformError as e:
+                return self._format_transform_error(source_frame, e)
+            return self._format_detections(
+                detections,
+                object_class,
+                coordinate_frame=self._target_frame_name(),
+            )
 
         # 直接用 test_raw_sub.py 的模式 — spin_once 循环
         import rclpy
@@ -337,8 +379,11 @@ class GetDetectionsTool(BaseTool):
         detections = self._parse_detection3d_array(payload)
 
         # TF 变换: rslidar → map
-        source_frame = payload.header.frame_id
-        detections = self._transform_detections(detections, source_frame)
+        source_frame = self._normalize_frame_id(payload.header.frame_id)
+        try:
+            detections = self._transform_detections(detections, source_frame)
+        except DetectionTransformError as e:
+            return self._format_transform_error(source_frame, e)
 
         # 按类别过滤
         if object_class:
@@ -353,15 +398,11 @@ class GetDetectionsTool(BaseTool):
                 msg = f"当前未检测到类别为 '{object_class}' 的目标。"
             return msg
 
-        label = f"（过滤: {object_class}）" if object_class else ""
-        lines = [f"检测到 {len(detections)} 个目标{label}:"]
-        for i, d in enumerate(detections, 1):
-            lines.append(
-                f"  {i}. {d.class_name} "
-                f"坐标({d.x:.2f}, {d.y:.2f}, {d.z:.2f}) "
-                f"置信度={d.confidence:.2f}"
-            )
-        return "\n".join(lines)
+        return self._format_detections(
+            detections,
+            object_class,
+            coordinate_frame=self._target_frame_name(),
+        )
 
 
 # ─── Tool: 发送导航目标 ──────────────────────────────────────────────────
