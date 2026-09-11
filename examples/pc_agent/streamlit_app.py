@@ -2,9 +2,11 @@
 """PC Agent Streamlit 控制台。"""
 
 import hashlib
+import json
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 _workspace_root = Path(__file__).resolve().parents[2]
 if str(_workspace_root) not in sys.path:
@@ -87,10 +89,12 @@ def queue_prompt(prompt: str) -> None:
 def clear_session() -> None:
     st.session_state.messages = [AIMessage(content="会话已清空。")]
     st.session_state.tool_events = []
+    st.session_state.execution_records = []
     st.session_state.pop("pending_prompt", None)
 
 
 def initialize_agent() -> None:
+    st.session_state.setdefault("execution_records", [])
     if "agent" in st.session_state:
         return
 
@@ -118,90 +122,146 @@ def initialize_agent() -> None:
     st.session_state.last_audio_hash = None
 
 
+def message_content(message) -> str:
+    content = message.content
+    if isinstance(content, str):
+        return content
+    # Text blocks are common with newer LangChain model adapters.
+    parts = []
+    for block in content or []:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts) if parts else json.dumps(content, ensure_ascii=False)
+
+
+def collect_execution(record: dict, messages: list) -> None:
+    """Keep tool results with their calls, including repeated calls to one tool."""
+    tools_by_call_id = {}
+    for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls or []:
+                tool_record = {
+                    "id": call.get("id", ""),
+                    "name": call.get("name", "tool"),
+                    "args": call.get("args", {}),
+                    "result": None,
+                    "status": "pending",
+                }
+                record["tools"].append(tool_record)
+                if tool_record["id"]:
+                    tools_by_call_id[tool_record["id"]] = tool_record
+        elif isinstance(message, ToolMessage):
+            call_id = message.tool_call_id
+            tool_record = tools_by_call_id.get(call_id)
+            if tool_record is None:
+                tool_record = {
+                    "id": call_id,
+                    "name": message.name or "tool",
+                    "args": None,
+                    "result": None,
+                    "status": "pending",
+                }
+                record["tools"].append(tool_record)
+            tool_record["result"] = message_content(message)
+            tool_record["status"] = getattr(message, "status", "success")
+
+    if messages and isinstance(messages[-1], AIMessage) and not messages[-1].tool_calls:
+        record["reply"] = message_content(messages[-1])
+
+
 def invoke_agent(prompt: str) -> None:
-    """执行一次 Agent 调用，并把工具调用保存到执行记录。"""
-    st.session_state.messages.append(HumanMessage(content=prompt))
-    started_at = time.strftime("%H:%M:%S")
+    """Store one request, its tool results and the displayed reply together."""
+    record = {
+        "id": uuid4().hex,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "prompt": prompt,
+        "tools": [],
+        "reply": "",
+        "error": "",
+    }
+    metadata = {"execution_id": record["id"], "time": record["time"]}
+    st.session_state.messages.append(
+        HumanMessage(content=prompt, additional_kwargs=metadata)
+    )
 
     try:
         result = st.session_state.agent.invoke(
             {"messages": [HumanMessage(content=prompt)]}
         )
+        collect_execution(record, result.get("messages", []))
     except Exception as exc:
-        message = f"Agent 执行失败：{exc}"
-        st.session_state.messages.append(AIMessage(content=message))
-        st.session_state.tool_events.append(
-            {
-                "time": started_at,
-                "kind": "error",
-                "name": "agent",
-                "content": str(exc),
-            }
-        )
-        return
+        record["error"] = str(exc)
+        record["reply"] = f"Agent 执行失败：{exc}"
 
-    final_text = ""
-    events = []
-    for message in result.get("messages", []):
-        if isinstance(message, AIMessage):
-            for call in getattr(message, "tool_calls", []) or []:
-                events.append(
-                    {
-                        "time": started_at,
-                        "kind": "call",
-                        "name": call.get("name", "tool"),
-                        "content": call.get("args", {}),
-                    }
-                )
-            if message.content and not getattr(message, "tool_calls", None):
-                final_text = str(message.content)
-        elif isinstance(message, ToolMessage):
-            events.append(
-                {
-                    "time": started_at,
-                    "kind": "result",
-                    "name": getattr(message, "name", None) or "tool",
-                    "content": str(message.content),
-                }
-            )
+    if not record["reply"]:
+        record["reply"] = "未收到 Agent 最终回复，请查看本次工具返回。"
+    st.session_state.messages.append(
+        AIMessage(content=record["reply"], additional_kwargs=metadata)
+    )
+    st.session_state.execution_records.append(record)
+    st.session_state.execution_records = st.session_state.execution_records[-20:]
 
-    if not final_text:
-        final_text = "操作已执行。"
-    st.session_state.messages.append(AIMessage(content=final_text))
-    st.session_state.tool_events.extend(events)
-    st.session_state.tool_events = st.session_state.tool_events[-40:]
+
+def render_tool_results(record: dict) -> None:
+    for tool_record in record["tools"]:
+        st.markdown(f"**{tool_record['name']}**")
+        if tool_record["args"] is not None:
+            st.json(tool_record["args"])
+        if tool_record["result"] is None:
+            st.warning("未收到工具返回结果")
+        else:
+            st.caption("工具原始返回")
+            st.text(tool_record["result"])
 
 
 def render_chat() -> None:
+    records_by_id = {
+        record["id"]: record for record in st.session_state.execution_records
+    }
     for message in st.session_state.messages:
+        execution_id = message.additional_kwargs.get("execution_id")
         if isinstance(message, HumanMessage):
             with st.chat_message("user"):
+                if execution_id:
+                    st.caption(f"{message.additional_kwargs['time']} · {execution_id[:8]}")
                 st.write(message.content)
         elif isinstance(message, AIMessage) and message.content:
             with st.chat_message("assistant"):
                 st.write(message.content)
+                record = records_by_id.get(execution_id)
+                if record and record["tools"]:
+                    with st.expander(f"本次工具返回 · {execution_id[:8]}"):
+                        render_tool_results(record)
 
 
 def render_activity() -> None:
-    events = list(reversed(st.session_state.tool_events))
-    if not events:
+    records = list(reversed(st.session_state.execution_records))
+    legacy_events = st.session_state.get("tool_events", [])
+    if not records and not legacy_events:
         st.info("暂无执行记录")
         return
 
-    for event in events:
-        kind = event["kind"]
-        name = event["name"]
-        content = event["content"]
-        title = {
-            "call": f"调用 {name}",
-            "result": f"{name} 返回结果",
-            "error": "Agent 错误",
-        }.get(kind, name)
-        with st.expander(f"{event['time']}  ·  {title}", expanded=False):
-            if kind == "call":
-                st.json(content)
-            else:
-                st.text(content)
+    for record in records:
+        with st.expander(
+            f"{record['time']} · {record['id'][:8]} · {record['prompt']}"
+        ):
+            if record["error"]:
+                st.error(record["error"])
+            render_tool_results(record)
+            st.markdown("**Agent 对话回复**")
+            st.write(record["reply"])
+
+    # Old flat events lack request IDs; do not guess their associated reply.
+    if legacy_events:
+        with st.expander("旧版未分组记录"):
+            for event in reversed(legacy_events):
+                st.caption(f"{event['time']} · {event['name']} · {event['kind']}")
+                if event["kind"] == "call":
+                    st.json(event["content"])
+                else:
+                    st.text(event["content"])
 
 
 initialize_agent()
