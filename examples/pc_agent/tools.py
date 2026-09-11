@@ -414,14 +414,6 @@ class NavigateToCoordinatesToolInput(BaseModel):
     y: float = Field(
         description="map 坐标系中的目标 y 坐标，单位 m。用户直接给出的 y 可直接使用。"
     )
-    z: float = Field(
-        default=0.0,
-        description="目标 z 坐标，二维 Nav2 会自动固定为 0，通常不要填写。",
-    )
-    yaw: float = Field(
-        default=0.0,
-        description="目标朝向，单位 rad；用户未提供朝向时使用 0。",
-    )
 
 
 class NavigateToCoordinatesTool(BaseTool):
@@ -431,9 +423,9 @@ class NavigateToCoordinatesTool(BaseTool):
     description: str = (
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
-        "参数为 x(m)、y(m)、可选 yaw(rad)；z 会被二维 Nav2 固定为 0。"
+        "只需要 x(m)、y(m)；工具会根据小车当前位置自动计算到目标的朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
-        "{x: -4.2, y: 2.97, yaw: 0}。"
+        "{x: -4.2, y: 2.97}。"
     )
     args_schema: Type[NavigateToCoordinatesToolInput] = (
         NavigateToCoordinatesToolInput
@@ -441,16 +433,17 @@ class NavigateToCoordinatesTool(BaseTool):
 
     connector: ROS2Connector = Field(..., exclude=True)
     frame_id: str = Field(default="map")
+    base_frame: str = Field(default="base_link")
     action_name: str = Field(default="/navigate_to_pose")
     action_timeout_sec: float = Field(
         default=10.0,
         description="等待 Nav2 Action Server 和目标接受的最长时间(秒)",
     )
 
-    def _run(self, x: float, y: float, z: float = 0.0, yaw: float = 0.0) -> str:
-        values = (x, y, z, yaw)
+    def _run(self, x: float, y: float) -> str:
+        values = (x, y)
         if not all(math.isfinite(float(value)) for value in values):
-            return "导航失败: x、y、z、yaw 必须是有限数字。"
+            return "导航失败: x、y 必须是有限数字。"
         if not math.isfinite(self.action_timeout_sec) or self.action_timeout_sec <= 0:
             return "导航失败: Action 等待时间必须大于 0 秒。"
 
@@ -458,8 +451,17 @@ class NavigateToCoordinatesTool(BaseTool):
         if not target.startswith("/"):
             target = "/" + target
         frame_id = self.frame_id.strip() or "map"
+        base_frame = self.base_frame.strip() or "base_link"
 
         try:
+            robot_tf = self.connector.get_transform(
+                target_frame=frame_id,
+                source_frame=base_frame,
+                timeout_sec=3.0,
+            )
+            robot_x = float(robot_tf.transform.translation.x)
+            robot_y = float(robot_tf.transform.translation.y)
+            yaw = math.atan2(y - robot_y, x - robot_x)
             quat = _quaternion_from_yaw(yaw)
             goal = {
                 "pose": {
@@ -485,8 +487,9 @@ class NavigateToCoordinatesTool(BaseTool):
 
             return (
                 f"导航指令已发送 (ID: {action_id})。\n"
-                f"目标({frame_id}): x={x:.2f}m, y={y:.2f}m, z=0.00m, "
-                f"yaw={yaw:.2f}rad\n"
+                f"目标({frame_id}): x={x:.2f}m, y={y:.2f}m\n"
+                f"已根据小车当前位置({robot_x:.2f}, {robot_y:.2f})"
+                f"计算朝向 yaw={yaw:.2f}rad\n"
                 f"小车正在前往目标..."
             )
         except Exception as e:

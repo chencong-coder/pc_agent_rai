@@ -109,7 +109,7 @@ docker run -d --name pc-agent --network=host --restart=always \
 | `停下` | 取消当前导航任务 |
 
 导航坐标必须来自检测结果或用户提供的 `map` 坐标，Agent 不应编造坐标。
-用户没有提供朝向时，工具默认 `yaw=0`；二维 Nav2 会自动把目标 `z` 设置为 `0`。
+导航工具只需要 `x、y`。工具会读取 `map -> base_link`，根据小车当前位置自动计算朝向 `yaw`，并将二维目标的 `z` 固定为 `0`。
 
 ## 命令行参数
 

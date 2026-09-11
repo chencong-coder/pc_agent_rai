@@ -19,7 +19,10 @@ PC (LLM) ←→ ROS 2 DDS ←→ Orin (Votenet + Nav2)
 - ✅ 文字 + 🎤 语音双输入（RAI ASR 语音识别）
 - ✅ Streamlit 网页前端
 - ✅ DeepSeek OpenAI 兼容接口 + 原生工具调用
-- ✅ TF 坐标自动变换 (rslidar → map)
+- ✅ TF 坐标自动变换 (`rslidar/velodyne` → `map`)
+- ✅ TF 转换失败时拒绝返回激光雷达坐标，避免发送错误导航目标
+- ✅ 导航只需要 `x、y`，根据小车当前位置自动计算到目标的朝向
+- ✅ Streamlit 执行记录按请求分组，显示工具原始返回和 Agent 回复
 - ✅ Docker 一键部署到 Orin
 
 ---
@@ -107,6 +110,93 @@ PC 浏览器访问: `http://<orin-ip>:8501`
 
 ---
 
+## 坐标与导航
+
+VoteNet 输出的检测中心通常在激光雷达坐标系，例如 `rslidar` 或
+`velodyne`。Agent 会读取检测消息的 `frame_id`，通过 TF 转换到 `map` 后，
+才把坐标交给大模型和导航工具。
+
+必须存在完整的 TF 链：
+
+```text
+map -> odom -> base_link -> velodyne
+```
+
+检查转换是否可用：
+
+```bash
+ros2 run tf2_ros tf2_echo map velodyne
+```
+
+如果 TF 不可用，Agent 会提示定位或 TF 问题，并且不会把原始雷达坐标当作
+Nav2 目标。使用 AMCL 时，先在 RViz 中点击 `2D Pose Estimate` 设置初始位姿。
+
+坐标导航工具只接收地图坐标 `x、y`：
+
+```text
+你: 去 map 坐标 x=-4.2, y=2.97
+```
+
+发送前，工具会读取 `map -> base_link` 得到小车当前位置，并用目标点和当前位置
+计算朝向：
+
+```text
+yaw = atan2(target_y - robot_y, target_x - robot_x)
+```
+
+随后将这个朝向转换成 Nav2 所需的四元数。用户不需要输入 `yaw` 或 `z`；二维
+导航会把目标高度固定为 `z=0`。
+
+---
+
+## Orin 启动顺序
+
+在 Orin 上启动 VoteNet 和 socket bridge：
+
+```bash
+source /opt/ros/foxy/setup.bash
+source ~/mm3d_ws/install/setup.bash
+
+ros2 run mmdet3d_ros2 detect_bbox3d_socket_bridge
+```
+
+确认 bridge 输出类似：
+
+```text
+Bridging /detect_bbox3d to tcp://0.0.0.0:8765
+```
+
+在运行 PC Agent 的 RAI 容器中启动：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /root/ros2_ws/install/setup.bash
+source /rai/.venv/bin/activate
+
+export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
+export OPENAI_API_KEY="$DEEPSEEK_API_KEY"
+
+python -m examples.pc_agent.main \
+  --detection-source socket \
+  --socket-host 127.0.0.1 \
+  --socket-port 8765 \
+  --frame-id map \
+  --target-frame map
+```
+
+启动网页控制台：
+
+```bash
+streamlit run examples/pc_agent/streamlit_app.py \
+  --server.address=0.0.0.0 \
+  --server.port=8501
+```
+
+如果 Agent 和 socket bridge 不在同一台机器，把 `--socket-host` 改成 Orin 的
+实际 IP，并确保 TCP 端口 `8765` 可访问。
+
+---
+
 ## 文件结构
 
 ```
@@ -127,10 +217,10 @@ examples/pc_agent/
 
 ```
 你: 周围有什么
-Agent: 检测到: bed (2.12, -1.62), chair (1.50, 2.00)...
+Agent: 检测到 chair，map 坐标 (-5.63, 2.18)，置信度 0.93...
 
 你: 找床
-Agent: 已找到床，正在导航前往 (2.12m, -1.62m)...
+Agent: 已找到床，正在导航前往 map 坐标 (2.12m, -1.62m)...
 
 你: 停下
 Agent: 导航已取消。

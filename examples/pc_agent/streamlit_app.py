@@ -281,7 +281,6 @@ with st.sidebar:
     with st.form("coordinate_navigation", clear_on_submit=False):
         x = st.number_input("X (m)", value=0.0, step=0.1, format="%.3f")
         y = st.number_input("Y (m)", value=0.0, step=0.1, format="%.3f")
-        yaw = st.number_input("Yaw (rad)", value=0.0, step=0.1, format="%.3f")
         navigate_submitted = st.form_submit_button(
             "发送导航目标",
             type="primary",
@@ -289,7 +288,7 @@ with st.sidebar:
         )
 
     if navigate_submitted:
-        queue_prompt(f"去 map 坐标 x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}")
+        queue_prompt(f"去 map 坐标 x={x:.3f}, y={y:.3f}")
 
     st.divider()
     st.markdown("### 快捷指令")
