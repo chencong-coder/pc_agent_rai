@@ -4,10 +4,13 @@
 import hashlib
 import json
 import math
+import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _workspace_root = Path(__file__).resolve().parents[2]
 if str(_workspace_root) not in sys.path:
@@ -95,6 +98,15 @@ def _yaw_from_quaternion(rotation) -> float:
     return math.atan2(sin_yaw, cos_yaw)
 
 
+def _display_timezone():
+    """Return the timezone used for timestamps shown in the web UI."""
+    timezone_name = os.environ.get("PC_AGENT_TIMEZONE", "Asia/Shanghai")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+
+
 def get_robot_pose():
     """Read the robot pose from the same map TF used by navigation."""
     connector = st.session_state.get("connector")
@@ -121,7 +133,8 @@ def get_robot_pose():
             "x": x,
             "y": y,
             "yaw": _yaw_from_quaternion(rotation),
-            "time": time.strftime("%H:%M:%S", time.localtime(timestamp)),
+            # This is the PC Agent's local read time, not the ROS message stamp.
+            "local_time": datetime.now(_display_timezone()).strftime("%H:%M:%S"),
             "stale": abs(age) > 3.0,
         }
     except Exception:
@@ -135,7 +148,7 @@ def render_robot_status() -> None:
     columns[0].metric("X（map，米）", f"{pose['x']:.3f}" if pose else "--")
     columns[1].metric("Y（map，米）", f"{pose['y']:.3f}" if pose else "--")
     columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}" if pose else "--")
-    columns[3].metric("更新时间", pose["time"] if pose else "--")
+    columns[3].metric("本地更新时间", pose["local_time"] if pose else "--")
     if pose is None:
         st.warning("等待 map 定位，暂无小车位置")
     elif pose["stale"]:
