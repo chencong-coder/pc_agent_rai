@@ -20,6 +20,7 @@ import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from examples.pc_agent.agent import create_pc_agent
+from examples.pc_agent.tools import get_navigation_status
 
 
 st.set_page_config(
@@ -45,6 +46,11 @@ st.markdown(
         border-radius: 6px;
         padding: 0.75rem 1rem;
         background: #ffffff;
+        min-width: 0;
+        overflow: hidden;
+    }
+    [data-testid="stColumn"] {
+        min-width: 0;
     }
     .status-ready {
         color: #047857;
@@ -141,10 +147,84 @@ def get_robot_pose():
         return None
 
 
+def _navigation_target(status: dict) -> str:
+    try:
+        return (
+            f"x={float(status.get('x')):.3f} m，"
+            f"y={float(status.get('y')):.3f} m"
+        )
+    except (TypeError, ValueError):
+        return "目标坐标未知"
+
+
+def _navigation_label(status: dict) -> str:
+    return {
+        "idle": "未导航",
+        "navigating": "正在导航",
+        "canceling": "正在取消",
+        "completed": "已完成",
+        "canceled": "已取消",
+        "failed": "失败",
+    }.get(status.get("status"), "未知")
+
+
+def _append_navigation_notice(status: dict) -> bool:
+    """Append one terminal navigation message to the conversation."""
+    terminal_states = {"completed", "canceled", "failed"}
+    if status.get("status") not in terminal_states:
+        return False
+
+    event_id = str(status.get("event_id") or "")
+    if not event_id or event_id == st.session_state.get("last_navigation_notice"):
+        return False
+    if "messages" not in st.session_state:
+        return False
+
+    target = _navigation_target(status)
+    messages = {
+        "completed": f"导航完成：小车已到达 map 坐标 {target}。",
+        "canceled": "导航已取消：小车已停止。",
+        "failed": f"导航未完成：目标 {target}。{status.get('message', '')}",
+    }
+    notice_time = datetime.now(_display_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.messages.append(
+        AIMessage(
+            content=messages[status["status"]],
+            additional_kwargs={
+                "time": notice_time,
+                "navigation_event": True,
+            },
+        )
+    )
+    st.session_state.last_navigation_notice = event_id
+    return True
+
+
+def _render_navigation_status(status: dict) -> None:
+    state = status.get("status")
+    target = _navigation_target(status)
+    if state == "navigating":
+        st.info(f"正在导航中 · 目标 map 坐标：{target}")
+    elif state == "canceling":
+        st.warning(f"正在取消导航 · 当前目标：{target}")
+    elif state == "completed":
+        st.success(f"导航完成 · 已到达 map 坐标：{target}")
+    elif state == "canceled":
+        st.warning("导航已取消 · 小车已停止")
+    elif state == "failed":
+        st.error(status.get("message") or "导航失败")
+
+
 def render_robot_status() -> None:
     pose = get_robot_pose()
+    navigation_status = get_navigation_status()
+    if _append_navigation_notice(navigation_status):
+        # The notice belongs in the normal chat area, so redraw the full app
+        # after adding it from the live status fragment.
+        st.rerun()
+
     st.markdown("#### 小车实时位置")
-    columns = st.columns(4)
+    columns = st.columns(4, gap="small")
     columns[0].metric("X（map，米）", f"{pose['x']:.3f}" if pose else "--")
     columns[1].metric("Y（map，米）", f"{pose['y']:.3f}" if pose else "--")
     columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}" if pose else "--")
@@ -153,6 +233,14 @@ def render_robot_status() -> None:
         st.warning("等待 map 定位，暂无小车位置")
     elif pose["stale"]:
         st.warning("定位数据已过期，显示的是最后已知位置")
+
+    _render_navigation_status(navigation_status)
+
+    status_columns = st.columns(4, gap="small")
+    status_columns[0].metric("Agent", "READY")
+    status_columns[1].metric("坐标系", "map")
+    status_columns[2].metric("检测来源", "Socket")
+    status_columns[3].metric("导航状态", _navigation_label(navigation_status))
 
 
 @st.fragment(run_every="1s")
@@ -467,12 +555,6 @@ with st.sidebar:
 st.title("无人车控制台")
 st.caption("PC Agent  ·  DeepSeek  ·  Nav2")
 render_live_robot_status()
-
-status_columns = st.columns(4)
-status_columns[0].metric("Agent", "READY")
-status_columns[1].metric("坐标系", "map")
-status_columns[2].metric("检测来源", "Socket")
-status_columns[3].metric("Action", "Nav2")
 
 st.divider()
 

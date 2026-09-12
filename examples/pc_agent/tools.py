@@ -45,6 +45,96 @@ _socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
 _socket_clients_lock = Lock()
 _active_navigation_action_id: Optional[str] = None
 _navigation_action_lock = Lock()
+_navigation_status: dict = {
+    "status": "idle",
+    "action_id": None,
+    "event_id": None,
+    "x": None,
+    "y": None,
+    "message": "",
+    "result_code": None,
+    "updated_at": 0.0,
+}
+
+
+def get_navigation_status() -> dict:
+    """Return a thread-safe snapshot of the latest Nav2 navigation status."""
+    with _navigation_action_lock:
+        return dict(_navigation_status)
+
+
+def _mark_navigation_canceling(action_id: str) -> None:
+    with _navigation_action_lock:
+        if _active_navigation_action_id != action_id:
+            return
+        _navigation_status.update(
+            status="canceling",
+            message="正在取消导航",
+            updated_at=time.time(),
+        )
+
+
+def _finish_navigation(
+    action_id: str,
+    status: str,
+    message: str,
+    result_code: Optional[int] = None,
+) -> None:
+    global _active_navigation_action_id
+    with _navigation_action_lock:
+        if _active_navigation_action_id != action_id:
+            return
+        _active_navigation_action_id = None
+        _navigation_status.update(
+            status=status,
+            action_id=action_id,
+            event_id=action_id,
+            message=message,
+            result_code=result_code,
+            updated_at=time.time(),
+        )
+
+
+def _mark_navigation_failed(x: float, y: float, message: str) -> None:
+    global _active_navigation_action_id
+    event_id = f"navigation-{time.time_ns()}"
+    with _navigation_action_lock:
+        _active_navigation_action_id = None
+        _navigation_status.update(
+            status="failed",
+            action_id=None,
+            event_id=event_id,
+            x=float(x),
+            y=float(y),
+            message=message,
+            result_code=None,
+            updated_at=time.time(),
+        )
+
+
+def _handle_navigation_done(action_id: str, future) -> None:
+    """Translate the Nav2 action result into the status consumed by Streamlit."""
+    try:
+        response = future.result()
+        result_code = int(getattr(response, "status", 0))
+    except Exception as exc:
+        _finish_navigation(
+            action_id,
+            "failed",
+            f"导航结果读取失败：{exc}",
+        )
+        return
+
+    terminal_states = {
+        4: ("completed", "导航完成"),
+        5: ("canceled", "导航已取消"),
+        6: ("failed", "导航失败，Nav2 已终止任务"),
+    }
+    status, message = terminal_states.get(
+        result_code,
+        ("failed", f"导航结束，Nav2 状态码 {result_code}"),
+    )
+    _finish_navigation(action_id, status, message, result_code)
 
 
 def _quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:
@@ -222,7 +312,7 @@ class GetDetectionsTool(BaseTool):
         for i, d in enumerate(detections, 1):
             lines.append(
                 f"  {i}. {d.class_name}: "
-                f"导航坐标 x={d.x:.2f}m, y={d.y:.2f}m; "
+                f"map坐标 x={d.x:.2f}m, y={d.y:.2f}m; "
                 f"检测高度 z={d.z:.2f}m; 置信度={d.confidence:.2f}"
             )
         return "\n".join(lines)
@@ -443,6 +533,7 @@ class NavigateToCoordinatesTool(BaseTool):
     )
 
     def _run(self, x: float, y: float) -> str:
+        global _active_navigation_action_id
         values = (x, y)
         if not all(math.isfinite(float(value)) for value in values):
             return "导航失败: x、y 必须是有限数字。"
@@ -480,24 +571,50 @@ class NavigateToCoordinatesTool(BaseTool):
             }
 
             msg = ROS2Message(payload=goal)
+            callback_context = {"action_id": None, "future": None}
+
+            def on_done(future) -> None:
+                with _navigation_action_lock:
+                    action_id = callback_context["action_id"]
+                    if action_id is None:
+                        callback_context["future"] = future
+                        return
+                _handle_navigation_done(action_id, future)
+
             action_id = self.connector.start_action(
                 action_data=msg,
                 target=target,
                 msg_type="nav2_msgs/action/NavigateToPose",
                 timeout_sec=self.action_timeout_sec,
+                on_done=on_done,
             )
             with _navigation_action_lock:
-                global _active_navigation_action_id
+                callback_context["action_id"] = action_id
                 _active_navigation_action_id = action_id
+                _navigation_status.update(
+                    status="navigating",
+                    action_id=action_id,
+                    event_id=action_id,
+                    x=float(x),
+                    y=float(y),
+                    message="正在导航中",
+                    result_code=None,
+                    updated_at=time.time(),
+                )
+                pending_future = callback_context.pop("future", None)
+
+            if pending_future is not None:
+                _handle_navigation_done(action_id, pending_future)
 
             return (
-                f"导航指令已发送 (ID: {action_id})。\n"
+                f"导航已开始 (ID: {action_id})。\n"
                 f"目标({frame_id}): x={x:.2f}m, y={y:.2f}m\n"
                 f"已根据小车当前位置({robot_x:.2f}, {robot_y:.2f})"
                 f"计算朝向 yaw={yaw:.2f}rad\n"
-                f"小车正在前往目标..."
+                f"小车正在导航中，到达后会提示导航完成。"
             )
         except Exception as e:
+            _mark_navigation_failed(x, y, f"导航失败：{e}")
             logger.error(f"导航失败: {e}")
             return f"导航失败: {e}。Orin Nav2 是否运行?"
 
@@ -514,6 +631,7 @@ class CancelNavigationTool(BaseTool):
 
     def _run(self) -> str:
         global _active_navigation_action_id
+        action_id = None
         try:
             with _navigation_action_lock:
                 action_id = _active_navigation_action_id
@@ -522,11 +640,11 @@ class CancelNavigationTool(BaseTool):
 
             # terminate_action expects the goal handle returned by start_action,
             # not the /navigate_to_pose action name.
+            _mark_navigation_canceling(action_id)
             self.connector.terminate_action(action_id)
-            with _navigation_action_lock:
-                if _active_navigation_action_id == action_id:
-                    _active_navigation_action_id = None
             return "取消请求已发送，小车正在停止。"
         except Exception as e:
+            if action_id:
+                _finish_navigation(action_id, "failed", f"取消导航失败：{e}")
             logger.error(f"取消导航失败: {e}")
             return f"取消失败: {e}"

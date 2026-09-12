@@ -111,6 +111,10 @@ docker run -d --name pc-agent --network=host --restart=always \
 导航坐标必须来自检测结果或用户提供的 `map` 坐标，Agent 不应编造坐标。
 导航工具只需要 `x、y`。工具会读取 `map -> base_link`，根据小车当前位置自动计算朝向 `yaw`，并将二维目标的 `z` 固定为 `0`。
 
+Streamlit 发送导航目标后会显示“正在导航”，并根据 Nav2 Action 的最终结果在
+对话区提示导航完成、取消或失败。检测列表中的每一项统一显示 `map` 坐标，
+不会只给某一项添加特殊的“导航坐标”前缀。
+
 ## 命令行参数
 
 ```text
