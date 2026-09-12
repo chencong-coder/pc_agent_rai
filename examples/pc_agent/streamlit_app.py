@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -80,10 +81,81 @@ def transcribe(audio_bytes: bytes):
     return asr.transcribe(data.astype(np.float32))
 
 
+def _yaw_from_quaternion(rotation) -> float:
+    """Convert a planar quaternion rotation to yaw in radians."""
+    components = tuple(float(value) for value in (
+        rotation.x, rotation.y, rotation.z, rotation.w
+    ))
+    norm = math.hypot(*components)
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("Invalid robot orientation")
+    x, y, z, w = (value / norm for value in components)
+    sin_yaw = 2.0 * (w * z + x * y)
+    cos_yaw = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(sin_yaw, cos_yaw)
+
+
+def get_robot_pose():
+    """Read the robot pose from the same map TF used by navigation."""
+    connector = st.session_state.get("connector")
+    if connector is None:
+        return None
+
+    try:
+        transform = connector.get_transform(
+            target_frame="map",
+            source_frame="base_link",
+            timeout_sec=0.2,
+        )
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        x, y = float(translation.x), float(translation.y)
+        if not all(math.isfinite(value) for value in (x, y)):
+            return None
+        stamp = transform.header.stamp
+        timestamp = stamp.sec + stamp.nanosec / 1e9
+        # Use ROS time for freshness, including when use_sim_time is enabled.
+        now = connector.node.get_clock().now().nanoseconds / 1e9
+        age = now - timestamp
+        return {
+            "x": x,
+            "y": y,
+            "yaw": _yaw_from_quaternion(rotation),
+            "time": time.strftime("%H:%M:%S", time.localtime(timestamp)),
+            "stale": abs(age) > 3.0,
+        }
+    except Exception:
+        return None
+
+
+def render_robot_status() -> None:
+    pose = get_robot_pose()
+    st.markdown("#### 小车实时位置")
+    columns = st.columns(4)
+    columns[0].metric("X（map，米）", f"{pose['x']:.3f}" if pose else "--")
+    columns[1].metric("Y（map，米）", f"{pose['y']:.3f}" if pose else "--")
+    columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}" if pose else "--")
+    columns[3].metric("更新时间", pose["time"] if pose else "--")
+    if pose is None:
+        st.warning("等待 map 定位，暂无小车位置")
+    elif pose["stale"]:
+        st.warning("定位数据已过期，显示的是最后已知位置")
+
+
+@st.fragment(run_every="1s")
+def render_live_robot_status() -> None:
+    render_robot_status()
+
+
 # ── 状态与 Agent ───────────────────────────────────────────────────────────
 
 def queue_prompt(prompt: str) -> None:
     st.session_state.pending_prompt = prompt
+
+
+def queue_cancel() -> None:
+    st.session_state.pending_prompt = "停下"
+    st.session_state.direct_cancel = True
 
 
 def clear_session() -> None:
@@ -187,9 +259,34 @@ def invoke_agent(prompt: str) -> None:
     )
 
     try:
-        result = st.session_state.agent.invoke(
-            {"messages": [HumanMessage(content=prompt)]}
-        )
+        direct_cancel = st.session_state.pop("direct_cancel", False)
+        direct_cancel = direct_cancel or prompt.strip() in {
+            "停下", "停止", "取消导航", "取消当前导航"
+        }
+        if direct_cancel:
+            cancel_tool = next(
+                tool for tool in st.session_state.tools
+                if tool.name == "cancel_navigation"
+            )
+            call_id = f"cancel-{uuid4().hex}"
+            tool_output = cancel_tool.invoke({
+                "name": "cancel_navigation",
+                "args": {},
+                "id": call_id,
+            })
+            result = {"messages": [
+                AIMessage(content="", tool_calls=[{
+                    "id": call_id,
+                    "name": "cancel_navigation",
+                    "args": {},
+                }]),
+                tool_output,
+                AIMessage(content=str(tool_output.content)),
+            ]}
+        else:
+            result = st.session_state.agent.invoke(
+                {"messages": [HumanMessage(content=prompt)]}
+            )
         collect_execution(record, result.get("messages", []))
     except Exception as exc:
         record["error"] = str(exc)
@@ -217,9 +314,6 @@ def render_tool_results(record: dict) -> None:
 
 
 def render_chat() -> None:
-    records_by_id = {
-        record["id"]: record for record in st.session_state.execution_records
-    }
     for message in st.session_state.messages:
         execution_id = message.additional_kwargs.get("execution_id")
         if isinstance(message, HumanMessage):
@@ -230,10 +324,6 @@ def render_chat() -> None:
         elif isinstance(message, AIMessage) and message.content:
             with st.chat_message("assistant"):
                 st.write(message.content)
-                record = records_by_id.get(execution_id)
-                if record and record["tools"]:
-                    with st.expander(f"本次工具返回 · {execution_id[:8]}"):
-                        render_tool_results(record)
 
 
 def render_activity() -> None:
@@ -279,16 +369,18 @@ with st.sidebar:
 
     st.markdown("### 坐标导航")
     with st.form("coordinate_navigation", clear_on_submit=False):
-        x = st.number_input("X (m)", value=0.0, step=0.1, format="%.3f")
-        y = st.number_input("Y (m)", value=0.0, step=0.1, format="%.3f")
+        x = st.number_input("目标 X（map，米）", value=0.0, step=0.1, format="%.3f")
+        y = st.number_input("目标 Y（map，米）", value=0.0, step=0.1, format="%.3f")
         navigate_submitted = st.form_submit_button(
-            "发送导航目标",
+            "发送目标点",
             type="primary",
             use_container_width=True,
         )
 
     if navigate_submitted:
-        queue_prompt(f"去 map 坐标 x={x:.3f}, y={y:.3f}")
+        queue_prompt(
+            f"导航到地图坐标：x={x:.3f} m，y={y:.3f} m（朝向按小车当前位置自动计算）"
+        )
 
     st.divider()
     st.markdown("### 快捷指令")
@@ -303,8 +395,8 @@ with st.sidebar:
             label,
             key=f"quick_{command}",
             use_container_width=True,
-            on_click=queue_prompt,
-            args=(command,),
+            on_click=queue_cancel if command == "停下" else queue_prompt,
+            args=() if command == "停下" else (command,),
         )
 
     st.divider()
@@ -341,6 +433,7 @@ with st.sidebar:
 
 st.title("无人车控制台")
 st.caption("PC Agent  ·  DeepSeek  ·  Nav2")
+render_live_robot_status()
 
 status_columns = st.columns(4)
 status_columns[0].metric("Agent", "READY")
@@ -358,7 +451,7 @@ with activity_tab:
 
 
 pending_prompt = st.session_state.pop("pending_prompt", None)
-typed_prompt = st.chat_input("输入指令，例如：去 map 坐标 x=0.913, y=10.206")
+typed_prompt = st.chat_input("输入指令，例如：导航到地图坐标 x=0.913 m，y=10.206 m")
 prompt = typed_prompt or pending_prompt
 
 if prompt:

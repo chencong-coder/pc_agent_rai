@@ -43,6 +43,8 @@ _detection_cache: dict = {}
 _detection_lock = Lock()
 _socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
 _socket_clients_lock = Lock()
+_active_navigation_action_id: Optional[str] = None
+_navigation_action_lock = Lock()
 
 
 def _quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:
@@ -219,9 +221,9 @@ class GetDetectionsTool(BaseTool):
         ]
         for i, d in enumerate(detections, 1):
             lines.append(
-                f"  {i}. {d.class_name} "
-                f"{coordinate_frame}坐标({d.x:.2f}, {d.y:.2f}, {d.z:.2f}) "
-                f"置信度={d.confidence:.2f}"
+                f"  {i}. {d.class_name}: "
+                f"导航坐标 x={d.x:.2f}m, y={d.y:.2f}m; "
+                f"检测高度 z={d.z:.2f}m; 置信度={d.confidence:.2f}"
             )
         return "\n".join(lines)
 
@@ -484,6 +486,9 @@ class NavigateToCoordinatesTool(BaseTool):
                 msg_type="nav2_msgs/action/NavigateToPose",
                 timeout_sec=self.action_timeout_sec,
             )
+            with _navigation_action_lock:
+                global _active_navigation_action_id
+                _active_navigation_action_id = action_id
 
             return (
                 f"导航指令已发送 (ID: {action_id})。\n"
@@ -508,14 +513,20 @@ class CancelNavigationTool(BaseTool):
     connector: ROS2Connector = Field(..., exclude=True)
 
     def _run(self) -> str:
+        global _active_navigation_action_id
         try:
-            actions = self.connector.get_actions_names_and_types()
-            cancelled = False
-            for name, _ in actions:
-                if "navigate_to_pose" in name:
-                    self.connector.terminate_action(name)
-                    cancelled = True
-            return "导航已取消，小车停止。" if cancelled else "当前无导航任务。"
+            with _navigation_action_lock:
+                action_id = _active_navigation_action_id
+            if not action_id:
+                return "当前没有可取消的导航任务。"
+
+            # terminate_action expects the goal handle returned by start_action,
+            # not the /navigate_to_pose action name.
+            self.connector.terminate_action(action_id)
+            with _navigation_action_lock:
+                if _active_navigation_action_id == action_id:
+                    _active_navigation_action_id = None
+            return "取消请求已发送，小车正在停止。"
         except Exception as e:
             logger.error(f"取消导航失败: {e}")
             return f"取消失败: {e}"
