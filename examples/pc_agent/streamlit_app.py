@@ -368,19 +368,39 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### 坐标导航")
-    with st.form("coordinate_navigation", clear_on_submit=False):
-        x = st.number_input("目标 X（map，米）", value=0.0, step=0.1, format="%.3f")
-        y = st.number_input("目标 Y（map，米）", value=0.0, step=0.1, format="%.3f")
-        navigate_submitted = st.form_submit_button(
-            "发送目标点",
-            type="primary",
-            use_container_width=True,
-        )
+    # Keep the fields empty so the placeholder remains visible until the user
+    # enters a target. A regular button also avoids Streamlit's English form
+    # submission hint that appears below focused form inputs.
+    x_text = st.text_input(
+        "目标 X（map，米）",
+        placeholder="例如：-0.550",
+        key="target_x",
+    )
+    y_text = st.text_input(
+        "目标 Y（map，米）",
+        placeholder="例如：2.340",
+        key="target_y",
+    )
+    navigate_submitted = st.button(
+        "发送目标点",
+        key="send_coordinate_goal",
+        type="primary",
+        use_container_width=True,
+    )
 
     if navigate_submitted:
-        queue_prompt(
-            f"导航到地图坐标：x={x:.3f} m，y={y:.3f} m（朝向按小车当前位置自动计算）"
-        )
+        try:
+            x = float(x_text.strip())
+            y = float(y_text.strip())
+        except (AttributeError, TypeError, ValueError):
+            st.error("请输入有效的 X、Y 坐标，例如：X=-0.550，Y=2.340")
+        else:
+            if not all(math.isfinite(value) for value in (x, y)):
+                st.error("X、Y 坐标必须是有限数字")
+            else:
+                queue_prompt(
+                    f"导航到地图坐标：x={x:.3f} m，y={y:.3f} m（朝向按小车当前位置自动计算）"
+                )
 
     st.divider()
     st.markdown("### 快捷指令")
