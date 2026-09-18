@@ -901,6 +901,7 @@ class NavigateToCoordinatesTool(BaseTool):
         base_frame = self.base_frame.strip() or "base_link"
 
         try:
+            # Sample the navigation start pose at goal-send time.
             robot_tf = self.connector.get_transform(
                 target_frame=frame_id,
                 source_frame=base_frame,
@@ -970,7 +971,11 @@ class NavigateToCoordinatesTool(BaseTool):
         except Exception as e:
             _mark_navigation_failed(x, y, f"导航失败：{e}")
             logger.error(f"导航失败: {e}")
-            return f"导航失败: {e}。Orin Nav2 是否运行?"
+            return (
+                f"导航失败：无法读取当前小车位姿 map -> {base_frame}：{e}。"
+                "请确认定位系统正在发布 map -> odom -> base_link TF，"
+                "不需要手动输入起点坐标。"
+            )
 
 
 # ─── Tool: 取消导航 ──────────────────────────────────────────────────────
