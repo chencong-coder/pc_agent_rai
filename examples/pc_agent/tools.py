@@ -43,6 +43,8 @@ _detection_cache: dict = {}
 _detection_lock = Lock()
 _socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
 _socket_clients_lock = Lock()
+_detection_snapshot_lock = Lock()
+_last_confirmed_detections: list = []
 _active_navigation_action_id: Optional[str] = None
 _navigation_action_lock = Lock()
 _navigation_status: dict = {
@@ -177,6 +179,17 @@ class DetectionObject(BaseModel):
     confidence: float = Field(default=0.0)
     direction: str = Field(default="方向未知")
     confirmed_hits: int = Field(default=1)
+
+
+def _set_detection_snapshot(detections: list[DetectionObject]) -> None:
+    global _last_confirmed_detections
+    with _detection_snapshot_lock:
+        _last_confirmed_detections = [d.model_copy() for d in detections]
+
+
+def get_detection_snapshot() -> list[DetectionObject]:
+    with _detection_snapshot_lock:
+        return [d.model_copy() for d in _last_confirmed_detections]
 
 
 class DetectionTransformError(RuntimeError):
@@ -423,7 +436,9 @@ class GetDetectionsTool(BaseTool):
         detections: list[DetectionObject],
         object_class: Optional[str] = None,
         coordinate_frame: str = "map",
+        snapshot_detections: Optional[list[DetectionObject]] = None,
     ) -> str:
+        snapshot = snapshot_detections or detections
         if object_class:
             detections = [
                 d for d in detections
@@ -435,6 +450,8 @@ class GetDetectionsTool(BaseTool):
             if object_class:
                 msg = f"当前未检测到类别为 '{object_class}' 的目标。"
             return msg
+
+        _set_detection_snapshot(snapshot)
 
         label = f"（过滤: {object_class}）" if object_class else ""
         lines = [
@@ -693,10 +710,12 @@ class GetDetectionsTool(BaseTool):
                 detections = self._transform_detections(detections, source_frame)
             except DetectionTransformError as e:
                 return self._format_transform_error(source_frame, e)
+            all_detections = list(detections)
             return self._format_detections(
                 detections,
                 object_class,
                 coordinate_frame=self._target_frame_name(),
+                snapshot_detections=all_detections,
             )
 
         # 直接用 test_raw_sub.py 的模式 — spin_once 循环
@@ -757,6 +776,78 @@ class GetDetectionsTool(BaseTool):
             detections,
             object_class,
             coordinate_frame=self._target_frame_name(),
+        )
+
+
+class NavigateToDetectedTargetInput(BaseModel):
+    target: str = Field(
+        description=(
+            "刚才检测结果中的目标选择。可填序号，如'1'；方向，如'左侧'、"
+            "'左前方'；或类别，如'椅子'。"
+        )
+    )
+
+
+class NavigateToDetectedTargetTool(BaseTool):
+    """Navigate using the last confirmed detection snapshot, never a new frame."""
+
+    name: str = "navigate_to_detected_target"
+    description: str = (
+        "根据最近一次 get_detections 返回的已确认目标导航。"
+        "用户说'去左侧的椅子'、'去第一个目标'时使用本工具；"
+        "不要重新调用 get_detections，也不要读取最新检测。"
+    )
+    args_schema: Type[NavigateToDetectedTargetInput] = NavigateToDetectedTargetInput
+    navigate_tool: object = Field(..., exclude=True)
+
+    def _run(self, target: str) -> str:
+        detections = get_detection_snapshot()
+        if not detections:
+            return "没有可用的已确认检测快照，请先调用 get_detections。"
+
+        query = str(target).strip().lower()
+        selected = []
+        try:
+            index = int(query) - 1
+            if 0 <= index < len(detections):
+                selected = [detections[index]]
+        except ValueError:
+            pass
+
+        if not selected:
+            direction_aliases = {
+                "左边": "左侧",
+                "左面": "左侧",
+                "右边": "右侧",
+                "右面": "右侧",
+                "前面": "正前方",
+                "后面": "正后方",
+            }
+            normalized_query = direction_aliases.get(query, query)
+            selected = [
+                detection for detection in detections
+                if normalized_query in detection.class_name.lower()
+                or normalized_query in detection.direction.lower()
+                or query in detection.class_name.lower()
+                or query in detection.direction.lower()
+            ]
+        if len(selected) != 1:
+            if not selected:
+                return f"最近的检测快照中没有匹配“{target}”的目标。"
+            return f"检测快照中有多个目标匹配“{target}”，请指定序号。"
+
+        detection = selected[0]
+        result = self.navigate_tool.invoke({
+            "x": detection.x,
+            "y": detection.y,
+        })
+        class_name = _CLASS_NAMES_ZH.get(
+            detection.class_name.lower(), detection.class_name
+        )
+        return (
+            f"已使用刚才确认的{class_name}（小车{detection.direction}）坐标导航，"
+            f"目标 map 坐标 x={detection.x:.2f}m, y={detection.y:.2f}m。\n"
+            f"{result}"
         )
 
 
