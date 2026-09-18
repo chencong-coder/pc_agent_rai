@@ -20,6 +20,11 @@ import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from examples.pc_agent.agent import create_pc_agent
+from examples.pc_agent.localization import (
+    LocalizationError,
+    get_localization_status,
+    start_global_localization,
+)
 from examples.pc_agent.tools import get_navigation_status
 
 
@@ -217,6 +222,7 @@ def _render_navigation_status(status: dict) -> None:
 
 def render_robot_status() -> None:
     pose = get_robot_pose()
+    localization_status = get_localization_status()
     navigation_status = get_navigation_status()
     if _append_navigation_notice(navigation_status):
         # The notice belongs in the normal chat area, so redraw the full app
@@ -229,17 +235,27 @@ def render_robot_status() -> None:
     columns[1].metric("Y（map，米）", f"{pose['y']:.3f}" if pose else "--")
     columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}" if pose else "--")
     columns[3].metric("本地更新时间", pose["local_time"] if pose else "--")
-    if pose is None:
-        st.warning("等待 map 定位，暂无小车位置")
+    localization_state = localization_status.get("status")
+    if localization_state == "localizing":
+        st.info(localization_status.get("message") or "AMCL 全局定位中")
+    elif localization_state == "failed":
+        st.error(localization_status.get("message") or "AMCL 定位失败")
+    elif pose is None:
+        st.warning("等待 map 定位；请点击侧栏的“自动定位”")
     elif pose["stale"]:
         st.warning("定位数据已过期，显示的是最后已知位置")
+    elif localization_state == "waiting":
+        st.info("等待 AMCL 定位确认；请点击侧栏的“自动定位”")
 
     _render_navigation_status(navigation_status)
 
     status_columns = st.columns(4, gap="small")
     status_columns[0].metric("Agent", "READY")
     status_columns[1].metric("坐标系", "map")
-    status_columns[2].metric("检测来源", "Socket")
+    status_columns[2].metric(
+        "定位状态",
+        localization_status.get("label", "等待定位"),
+    )
     status_columns[3].metric("导航状态", _navigation_label(navigation_status))
 
 
@@ -289,7 +305,7 @@ def initialize_agent() -> None:
     st.session_state.tools = tools
     st.session_state.connector = connector
     st.session_state.messages = [
-        AIMessage(content="已连接。可以输入地图坐标、目标类别，或发送停止指令。")
+        AIMessage(content="已连接。请先自动定位，再输入地图坐标或目标类别。")
     ]
     st.session_state.tool_events = []
     st.session_state.last_audio_hash = None
@@ -468,6 +484,34 @@ with st.sidebar:
     st.markdown('<span class="status-ready">● Agent 已就绪</span>', unsafe_allow_html=True)
     st.divider()
 
+    st.markdown("### 定位")
+    sidebar_localization = get_localization_status()
+    sidebar_navigation = get_navigation_status()
+    localization_busy = sidebar_localization.get("status") == "localizing"
+    navigation_busy = sidebar_navigation.get("status") in {
+        "navigating",
+        "canceling",
+    }
+    locate_submitted = st.button(
+        "自动定位",
+        key="start_global_localization",
+        type="primary",
+        use_container_width=True,
+        disabled=localization_busy or navigation_busy,
+    )
+    st.caption(f"AMCL：{sidebar_localization.get('label', '等待定位')}")
+    if locate_submitted:
+        try:
+            started = start_global_localization()
+        except LocalizationError as exc:
+            st.error(f"无法启动自动定位：{exc}")
+        else:
+            if started:
+                st.info("自动定位已启动，小车正在原地缓慢旋转")
+            else:
+                st.info("自动定位正在进行中")
+
+    st.divider()
     st.markdown("### 坐标导航")
     # Keep the fields empty so the placeholder remains visible until the user
     # enters a target. A regular button also avoids Streamlit's English form

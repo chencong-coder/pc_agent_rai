@@ -35,6 +35,7 @@ from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
 
 from .detect_socket_client import DetectBBox3DSocketClient
+from .localization import LocalizationError
 
 logger = logging.getLogger(__name__)
 
@@ -869,6 +870,7 @@ class NavigateToCoordinatesTool(BaseTool):
     description: str = (
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
+        "导航前必须已通过页面的自动定位按钮完成 AMCL 定位。"
         "只需要 x(m)、y(m)；工具会根据小车当前位置自动计算到目标的朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
         "{x: -4.2, y: 2.97}。"
@@ -878,6 +880,7 @@ class NavigateToCoordinatesTool(BaseTool):
     )
 
     connector: ROS2Connector = Field(..., exclude=True)
+    localization_manager: object | None = Field(default=None, exclude=True)
     frame_id: str = Field(default="map")
     base_frame: str = Field(default="base_link")
     action_name: str = Field(default="/navigate_to_pose")
@@ -901,6 +904,9 @@ class NavigateToCoordinatesTool(BaseTool):
         base_frame = self.base_frame.strip() or "base_link"
 
         try:
+            if self.localization_manager is not None:
+                self.localization_manager.require_localized()
+
             # Sample the navigation start pose at goal-send time.
             robot_tf = self.connector.get_transform(
                 target_frame=frame_id,
@@ -968,6 +974,11 @@ class NavigateToCoordinatesTool(BaseTool):
                 f"计算朝向 yaw={yaw:.2f}rad\n"
                 f"小车正在导航中，到达后会提示导航完成。"
             )
+        except LocalizationError as e:
+            message = f"AMCL 定位不可用：{e}"
+            _mark_navigation_failed(x, y, message)
+            logger.error(message)
+            return f"导航未启动：{message}。"
         except Exception as e:
             _mark_navigation_failed(x, y, f"导航失败：{e}")
             logger.error(f"导航失败: {e}")
@@ -987,20 +998,30 @@ class CancelNavigationTool(BaseTool):
     description: str = "取消当前导航任务，让小车停止。用户说'停下'/'停止'时使用。"
 
     connector: ROS2Connector = Field(..., exclude=True)
+    localization_manager: object | None = Field(default=None, exclude=True)
 
     def _run(self) -> str:
         global _active_navigation_action_id
         action_id = None
         try:
+            localization_canceled = False
+            if self.localization_manager is not None:
+                localization_canceled = (
+                    self.localization_manager.cancel_global_localization()
+                )
             with _navigation_action_lock:
                 action_id = _active_navigation_action_id
             if not action_id:
+                if localization_canceled:
+                    return "自动定位已取消，小车正在停止。"
                 return "当前没有可取消的导航任务。"
 
             # terminate_action expects the goal handle returned by start_action,
             # not the /navigate_to_pose action name.
             _mark_navigation_canceling(action_id)
             self.connector.terminate_action(action_id)
+            if localization_canceled:
+                return "自动定位和导航取消请求均已发送，小车正在停止。"
             return "取消请求已发送，小车正在停止。"
         except Exception as e:
             if action_id:
