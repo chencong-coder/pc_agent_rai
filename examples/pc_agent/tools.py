@@ -56,6 +56,20 @@ _navigation_status: dict = {
     "updated_at": 0.0,
 }
 
+_CLASS_NAMES_ZH = {
+    "bed": "床",
+    "chair": "椅子",
+    "sofa": "沙发",
+    "table": "桌子",
+    "desk": "书桌",
+    "cabinet": "柜子",
+    "door": "门",
+    "window": "窗户",
+    "bookshelf": "书架",
+    "toilet": "马桶",
+    "sink": "水槽",
+}
+
 
 def get_navigation_status() -> dict:
     """Return a thread-safe snapshot of the latest Nav2 navigation status."""
@@ -161,10 +175,121 @@ class DetectionObject(BaseModel):
     y: float = Field(description="y (m)")
     z: float = Field(description="z (m)")
     confidence: float = Field(default=0.0)
+    direction: str = Field(default="方向未知")
+    confirmed_hits: int = Field(default=1)
 
 
 class DetectionTransformError(RuntimeError):
     """Raised when a detection cannot be converted into the navigation frame."""
+
+
+class DetectionTrack:
+    """Track one same-class object across several detection frames."""
+
+    def __init__(self, detection: DetectionObject, timestamp: float):
+        self.class_name = detection.class_name
+        self.samples = [(timestamp, detection)]
+        self.last_seen = timestamp
+        self.missed_frames = 0
+
+    @property
+    def last_detection(self) -> DetectionObject:
+        return self.samples[-1][1]
+
+    def add(
+        self, detection: DetectionObject, timestamp: float, window_size: int
+    ) -> None:
+        self.samples.append((timestamp, detection))
+        self.samples = self.samples[-window_size:]
+        self.last_seen = timestamp
+        self.missed_frames = 0
+
+    def smooth(self) -> DetectionObject:
+        recent = [detection for _, detection in self.samples[-3:]]
+        def median(values):
+            return sorted(values)[len(values) // 2]
+        return DetectionObject(
+            class_name=self.class_name,
+            x=median([d.x for d in recent]),
+            y=median([d.y for d in recent]),
+            z=median([d.z for d in recent]),
+            confidence=sum(d.confidence for d in recent) / len(recent),
+            direction=self.last_detection.direction,
+            confirmed_hits=len(self.samples),
+        )
+
+
+class DetectionStabilizer:
+    """Confirm objects after repeated spatially consistent observations."""
+
+    def __init__(
+        self,
+        min_hits: int = 3,
+        window_size: int = 5,
+        window_seconds: float = 1.0,
+        match_distance: float = 0.5,
+        max_missed_frames: int = 3,
+    ):
+        self.min_hits = min_hits
+        self.window_size = window_size
+        self.window_seconds = window_seconds
+        self.match_distance = match_distance
+        self.max_missed_frames = max_missed_frames
+        self.tracks: list[DetectionTrack] = []
+        self.last_payload_time = 0.0
+
+    def update(
+        self, detections: list[DetectionObject], timestamp: float
+    ) -> list[DetectionObject]:
+        for track in self.tracks:
+            track.missed_frames += 1
+
+        unmatched = set(range(len(detections)))
+        candidates = []
+        for track_index, track in enumerate(self.tracks):
+            previous = track.last_detection
+            for detection_index in unmatched:
+                detection = detections[detection_index]
+                if detection.class_name.lower() != track.class_name.lower():
+                    continue
+                distance = math.hypot(
+                    detection.x - previous.x,
+                    detection.y - previous.y,
+                )
+                if distance <= self.match_distance:
+                    candidates.append((distance, track_index, detection_index))
+
+        for _, track_index, detection_index in sorted(candidates):
+            if detection_index not in unmatched:
+                continue
+            track = self.tracks[track_index]
+            track.add(
+                detections[detection_index], timestamp, self.window_size
+            )
+            unmatched.remove(detection_index)
+
+        for detection_index in unmatched:
+            self.tracks.append(
+                DetectionTrack(detections[detection_index], timestamp)
+            )
+
+        self.tracks = [
+            track for track in self.tracks
+            if track.missed_frames <= self.max_missed_frames
+            and timestamp - track.last_seen <= self.window_seconds * 2
+        ]
+        self.last_payload_time = timestamp
+
+        confirmed = []
+        for track in self.tracks:
+            if len(track.samples) < self.min_hits:
+                continue
+            recent = track.samples[-self.min_hits:]
+            if recent[-1][0] - recent[0][0] > self.window_seconds:
+                continue
+            if track.missed_frames == 0:
+                confirmed.append(track.smooth())
+        return confirmed
 
 
 # ─── Tool: 获取检测结果 ───────────────────────────────────────────────────
@@ -199,6 +324,9 @@ class GetDetectionsTool(BaseTool):
     target_frame: str = Field(default="map", description="TF 变换目标坐标系")
     cache_max_age: float = Field(default=10.0, description="缓存有效时间(秒)")
     timeout_sec: float = Field(default=15.0)
+    confirmation_hits: int = Field(default=3)
+    confirmation_window: int = Field(default=5)
+    confirmation_distance: float = Field(default=0.5)
 
     def _ensure_subscribed(self):
         import rclpy
@@ -283,6 +411,10 @@ class GetDetectionsTool(BaseTool):
                 class_name=class_id,
                 x=x, y=y, z=z,
                 confidence=score,
+                direction=str(
+                    det.get("relative_direction", det.get("direction", "方向未知"))
+                ),
+                confirmed_hits=int(det.get("confirmed_hits", 1) or 1),
             ))
         return detections
 
@@ -310,12 +442,126 @@ class GetDetectionsTool(BaseTool):
             f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:"
         ]
         for i, d in enumerate(detections, 1):
+            display_name = _CLASS_NAMES_ZH.get(
+                d.class_name.lower(), d.class_name
+            )
             lines.append(
-                f"  {i}. {d.class_name}: "
+                f"  {i}. {display_name}（{d.class_name}）: "
+                f"在小车{d.direction}; "
                 f"map坐标 x={d.x:.2f}m, y={d.y:.2f}m; "
-                f"检测高度 z={d.z:.2f}m; 置信度={d.confidence:.2f}"
+                f"检测高度 z={d.z:.2f}m; 置信度={d.confidence:.2f}; "
+                f"已连续确认 {d.confirmed_hits} 帧"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _direction_from_robot_frame(x: float, y: float) -> str:
+        """Return a coarse Chinese direction in base_link coordinates."""
+        angle = math.atan2(y, x)
+        if -math.pi / 8 <= angle < math.pi / 8:
+            return "正前方"
+        if math.pi / 8 <= angle < 3 * math.pi / 8:
+            return "左前方"
+        if 3 * math.pi / 8 <= angle < 5 * math.pi / 8:
+            return "左侧"
+        if 5 * math.pi / 8 <= angle < 7 * math.pi / 8:
+            return "左后方"
+        if angle >= 7 * math.pi / 8 or angle < -7 * math.pi / 8:
+            return "正后方"
+        if -7 * math.pi / 8 <= angle < -5 * math.pi / 8:
+            return "右后方"
+        if -5 * math.pi / 8 <= angle < -3 * math.pi / 8:
+            return "右侧"
+        return "右前方"
+
+    def _get_direction_transform(self, source_frame: str):
+        source_frame = self._normalize_frame_id(source_frame)
+        if not source_frame:
+            return None
+        if source_frame == "base_link":
+            return True
+        try:
+            return self.connector.get_transform(
+                target_frame="base_link",
+                source_frame=source_frame,
+                timeout_sec=1.0,
+            )
+        except Exception as exc:
+            logger.warning("无法计算相对方向 %s→base_link: %s", source_frame, exc)
+            return None
+
+    def _apply_direction_transform(
+        self, detections: list[DetectionObject], transform
+    ) -> list[DetectionObject]:
+        if transform is True:
+            return [
+                d.model_copy(update={
+                    "direction": self._direction_from_robot_frame(d.x, d.y)
+                })
+                for d in detections
+            ]
+        if transform is None:
+            return [
+                d.model_copy(update={
+                    "direction": d.direction or "方向未知"
+                })
+                for d in detections
+            ]
+        q = transform.transform.rotation
+        t = transform.transform.translation
+        result = []
+        for detection in detections:
+            x, y, _ = self._apply_transform(
+                detection.x, detection.y, detection.z,
+                q.x, q.y, q.z, q.w,
+                t.x, t.y, t.z,
+            )
+            result.append(
+                detection.model_copy(
+                    update={"direction": self._direction_from_robot_frame(x, y)}
+                )
+            )
+        return result
+
+    def _stabilize_socket_payload(
+        self,
+        client: DetectBBox3DSocketClient,
+        start: float,
+    ) -> tuple[dict | None, list[DetectionObject]]:
+        stabilizer = DetectionStabilizer(
+            min_hits=self.confirmation_hits,
+            window_size=self.confirmation_window,
+            window_seconds=min(1.0, self.timeout_sec),
+            match_distance=self.confirmation_distance,
+        )
+        last_sequence = None
+        latest_payload = None
+        while time.time() - start < self.timeout_sec:
+            payload = client.get_latest(max_age=self.cache_max_age)
+            if payload is None:
+                time.sleep(0.05)
+                continue
+            sequence = (payload.get("stamp", {}).get("sec"),
+                        payload.get("stamp", {}).get("nanosec"))
+            if sequence == last_sequence:
+                time.sleep(0.05)
+                continue
+            last_sequence = sequence
+            latest_payload = payload
+            detections = self._parse_socket_payload(payload)
+            if payload.get("stabilized") and detections:
+                return payload, detections
+            payload_time = time.time()
+            stamp = payload.get("stamp", {}) or {}
+            if stamp.get("sec") is not None and stamp.get("nanosec") is not None:
+                candidate_time = float(stamp["sec"]) + float(stamp["nanosec"]) / 1e9
+                if candidate_time > 0:
+                    payload_time = candidate_time
+            confirmed = stabilizer.update(detections, payload_time)
+            if confirmed:
+                return payload, confirmed
+            time.sleep(0.05)
+        return latest_payload, []
 
     @staticmethod
     def _normalize_frame_id(frame_id: object) -> str:
@@ -399,6 +645,8 @@ class GetDetectionsTool(BaseTool):
                 class_name=det.class_name,
                 x=nx, y=ny, z=nz,
                 confidence=det.confidence,
+                direction=det.direction,
+                confirmed_hits=det.confirmed_hits,
             ))
         logger.info(
             f"TF: {len(result)} 个目标 {source_frame}→{target_frame}"
@@ -409,13 +657,8 @@ class GetDetectionsTool(BaseTool):
         if self.detection_source == "socket":
             client = _get_socket_client(self.socket_host, self.socket_port)
 
-            payload = None
             start = time.time()
-            while time.time() - start < self.timeout_sec:
-                payload = client.get_latest(max_age=self.cache_max_age)
-                if payload is not None:
-                    break
-                time.sleep(0.1)
+            payload, detections = self._stabilize_socket_payload(client, start)
 
             if payload is None:
                 return (
@@ -424,8 +667,28 @@ class GetDetectionsTool(BaseTool):
                     f"并监听 {self.socket_host}:{self.socket_port}。"
                 )
 
-            detections = self._parse_socket_payload(payload)
+            if payload.get("stabilized") and payload.get("stabilization_state") != "confirmed":
+                return (
+                    f"暂未确认稳定目标。已等待 {self.timeout_sec:.1f}s，至少需要"
+                    f" {self.confirmation_hits} 帧一致检测。"
+                )
+
+            if not detections:
+                if object_class:
+                    return (
+                        f"暂未确认类别为 '{object_class}' 的稳定目标。"
+                        f"已等待 {self.timeout_sec:.1f}s，至少需要"
+                        f" {self.confirmation_hits} 帧一致检测。"
+                    )
+                return (
+                    f"暂未确认稳定目标。已等待 {self.timeout_sec:.1f}s，至少需要"
+                    f" {self.confirmation_hits} 帧一致检测。"
+                )
             source_frame = self._normalize_frame_id(payload.get("frame_id", ""))
+            direction_transform = self._get_direction_transform(source_frame)
+            detections = self._apply_direction_transform(
+                detections, direction_transform
+            )
             try:
                 detections = self._transform_detections(detections, source_frame)
             except DetectionTransformError as e:
