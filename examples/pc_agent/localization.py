@@ -17,14 +17,14 @@
 import logging
 import math
 import time
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Callable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 _STATUS_LABELS = {
     "waiting": "等待定位",
-    "localizing": "全局定位中",
+    "localizing": "正在定位",
     "localized": "已定位",
     "failed": "定位失败",
 }
@@ -80,6 +80,21 @@ def _make_ros2_message(payload: dict):
     return ROS2Message(payload=payload)
 
 
+def _yaw_from_quaternion(rotation) -> float:
+    components = tuple(
+        float(value)
+        for value in (rotation.x, rotation.y, rotation.z, rotation.w)
+    )
+    norm = math.sqrt(sum(value * value for value in components))
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("AMCL orientation is invalid")
+    x, y, z, w = (value / norm for value in components)
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
 def get_localization_status() -> dict:
     """Return the status of the manager shared by navigation and Streamlit."""
     with _active_manager_lock:
@@ -96,6 +111,7 @@ def get_localization_status() -> dict:
             "y_variance": None,
             "yaw_variance": None,
             "last_pose_age": None,
+            "pose": None,
             "updated_at": 0.0,
         }
     return manager.get_status()
@@ -108,6 +124,15 @@ def start_global_localization() -> bool:
     if manager is None:
         raise LocalizationError("定位管理器尚未初始化")
     return manager.start_global_localization()
+
+
+def cancel_global_localization() -> bool:
+    """Cancel the background AMCL global-localization attempt."""
+    with _active_manager_lock:
+        manager = _active_manager
+    if manager is None:
+        raise LocalizationError("定位管理器尚未初始化")
+    return manager.cancel_global_localization()
 
 
 class LocalizationManager:
@@ -165,6 +190,7 @@ class LocalizationManager:
         self._message = "等待 AMCL 定位数据"
         self._stable_samples = 0
         self._last_pose_at: Optional[float] = None
+        self._confirmed_pose: Optional[dict] = None
         self._variances: tuple[Optional[float], Optional[float], Optional[float]] = (
             None,
             None,
@@ -188,37 +214,65 @@ class LocalizationManager:
         self._message = message
         self._updated_at = self._wall_clock()
 
+    def _clear_confirmation_locked(self) -> None:
+        self._stable_samples = 0
+        self._confirmed_pose = None
+
+    def _confirm_pose_locked(self, x: float, y: float, yaw: float) -> None:
+        self._confirmed_pose = {
+            "x": x,
+            "y": y,
+            "yaw": yaw,
+            "updated_at": self._wall_clock(),
+        }
+
     def _is_localized_locked(self, now: float) -> bool:
         return (
             self._status == "localized"
             and self._last_pose_at is not None
             and now - self._last_pose_at <= self.freshness_sec
             and self._stable_samples >= self.required_samples
+            and self._confirmed_pose is not None
         )
 
     def _on_amcl_pose(self, message) -> None:
         try:
             payload = getattr(message, "payload", message)
-            covariance = payload.pose.covariance
-            self.observe_covariance(covariance)
+            pose_with_covariance = payload.pose
+            pose = pose_with_covariance.pose
+            position = pose.position
+            self.observe_pose(
+                pose_with_covariance.covariance,
+                float(position.x),
+                float(position.y),
+                _yaw_from_quaternion(pose.orientation),
+            )
         except Exception as exc:
-            logger.warning("无法读取 %s 协方差: %s", self.pose_topic, exc)
+            logger.warning("无法读取 %s 位姿: %s", self.pose_topic, exc)
+            self.observe_pose((), math.nan, math.nan, math.nan)
 
-    def observe_covariance(
+    def observe_pose(
         self,
         covariance: Sequence[float],
+        x: float,
+        y: float,
+        yaw: float,
         received_at: Optional[float] = None,
     ) -> None:
-        """Record one AMCL sample. Public to keep quality logic testable."""
+        """Record one complete AMCL pose and covariance sample."""
         now = self._clock() if received_at is None else received_at
+        pose_is_valid = all(math.isfinite(value) for value in (x, y, yaw))
         try:
             variances = covariance_values(covariance)
         except (TypeError, ValueError):
             variances = (None, None, None)
-        converged = covariance_is_converged(
-            covariance,
-            self.xy_variance_threshold,
-            self.yaw_variance_threshold,
+        converged = (
+            pose_is_valid
+            and covariance_is_converged(
+                covariance,
+                self.xy_variance_threshold,
+                self.yaw_variance_threshold,
+            )
         )
 
         with self._state_lock:
@@ -230,37 +284,37 @@ class LocalizationManager:
             self._last_pose_at = now
             self._variances = variances
 
-            if converged:
+            if self._status == "localizing" and converged:
                 self._stable_samples += 1
                 if self._stable_samples >= self.required_samples:
+                    self._stable_samples = self.required_samples
+                    self._confirm_pose_locked(x, y, yaw)
                     self._set_status_locked(
                         "localized",
                         f"AMCL 已连续 {self.required_samples} 帧收敛",
                     )
-                elif self._status == "localizing":
+                else:
                     self._set_status_locked(
                         "localizing",
                         "AMCL 全局定位中"
                         f"（稳定样本 {self._stable_samples}/{self.required_samples}）",
                     )
-                else:
-                    self._set_status_locked(
-                        "waiting",
-                        "等待 AMCL 定位确认"
-                        f"（稳定样本 {self._stable_samples}/{self.required_samples}）",
-                    )
-            else:
+            elif self._status == "localizing":
                 self._stable_samples = 0
-                if self._status == "localizing":
-                    self._set_status_locked(
-                        "localizing",
-                        "AMCL 全局定位中（协方差尚未收敛）",
-                    )
-                else:
-                    self._set_status_locked(
-                        "waiting",
-                        "AMCL 定位尚未收敛",
-                    )
+                self._confirmed_pose = None
+                self._set_status_locked(
+                    "localizing",
+                    "AMCL 全局定位中（位姿质量尚未收敛）",
+                )
+            elif self._status == "localized" and converged:
+                self._stable_samples = self.required_samples
+                self._confirm_pose_locked(x, y, yaw)
+            elif self._status == "localized":
+                self._clear_confirmation_locked()
+                self._set_status_locked(
+                    "waiting",
+                    "AMCL 定位质量已失效，请重新点击“自动定位”",
+                )
 
     def is_localized(self) -> bool:
         now = self._clock()
@@ -275,7 +329,7 @@ class LocalizationManager:
                 and now - self._last_pose_at <= self.freshness_sec
             )
             if self._status == "localized" and not self._is_localized_locked(now):
-                self._stable_samples = 0
+                self._clear_confirmation_locked()
                 self._set_status_locked(
                     "waiting",
                     "AMCL 定位数据已过期，请重新点击“自动定位”",
@@ -295,6 +349,9 @@ class LocalizationManager:
                 "y_variance": y_variance,
                 "yaw_variance": yaw_variance,
                 "last_pose_age": age,
+                "pose": dict(self._confirmed_pose)
+                if self._is_localized_locked(now)
+                else None,
                 "updated_at": self._updated_at,
             }
 
@@ -311,6 +368,7 @@ class LocalizationManager:
 
     def _mark_failed(self, message: str) -> None:
         with self._state_lock:
+            self._clear_confirmation_locked()
             self._set_status_locked("failed", message)
 
     def require_localized(self) -> dict:
@@ -330,6 +388,10 @@ class LocalizationManager:
             logger.info("AMCL 自动定位已取消")
         except LocalizationError:
             logger.exception("AMCL 自动定位失败")
+        finally:
+            with self._background_lock:
+                if self._background_thread is current_thread():
+                    self._background_thread = None
 
     def start_global_localization(self) -> bool:
         """Start global localization without blocking the Streamlit page."""
@@ -341,7 +403,7 @@ class LocalizationManager:
                 return False
             self._cancel_event.clear()
             with self._state_lock:
-                self._stable_samples = 0
+                self._clear_confirmation_locked()
                 self._set_status_locked(
                     "localizing",
                     "正在启动 AMCL 全局定位，小车将原地缓慢旋转",
@@ -359,6 +421,7 @@ class LocalizationManager:
         with self._state_lock:
             active = self._status == "localizing"
             if active:
+                self._clear_confirmation_locked()
                 self._set_status_locked("waiting", "自动定位已取消")
         if not active:
             return False
@@ -379,7 +442,7 @@ class LocalizationManager:
                 raise LocalizationCanceled("自动定位已取消")
 
             with self._state_lock:
-                self._stable_samples = 0
+                self._clear_confirmation_locked()
                 self._set_status_locked(
                     "localizing",
                     "正在启动 AMCL 全局定位，小车将原地缓慢旋转",
@@ -411,7 +474,7 @@ class LocalizationManager:
                     localized = self.is_localized()
                 if error is None and not localized:
                     error = LocalizationError(
-                        f"AMCL 在 {self.timeout_sec:.0f} 秒内未收敛"
+                        f"AMCL 在 {self.timeout_sec:g} 秒内未收敛"
                     )
             except Exception as exc:
                 if isinstance(exc, LocalizationError):
@@ -433,7 +496,7 @@ class LocalizationManager:
                 error = LocalizationError("AMCL 定位结果在停车后失效")
             if isinstance(error, LocalizationCanceled):
                 with self._state_lock:
-                    self._stable_samples = 0
+                    self._clear_confirmation_locked()
                     self._set_status_locked("waiting", str(error))
                 raise error
             if error is not None:

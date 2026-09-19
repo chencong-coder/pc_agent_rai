@@ -22,6 +22,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from examples.pc_agent.agent import create_pc_agent
 from examples.pc_agent.localization import (
     LocalizationError,
+    cancel_global_localization,
     get_localization_status,
     start_global_localization,
 )
@@ -95,20 +96,6 @@ def transcribe(audio_bytes: bytes):
     return asr.transcribe(data.astype(np.float32))
 
 
-def _yaw_from_quaternion(rotation) -> float:
-    """Convert a planar quaternion rotation to yaw in radians."""
-    components = tuple(float(value) for value in (
-        rotation.x, rotation.y, rotation.z, rotation.w
-    ))
-    norm = math.hypot(*components)
-    if not math.isfinite(norm) or norm == 0.0:
-        raise ValueError("Invalid robot orientation")
-    x, y, z, w = (value / norm for value in components)
-    sin_yaw = 2.0 * (w * z + x * y)
-    cos_yaw = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(sin_yaw, cos_yaw)
-
-
 def _display_timezone():
     """Return the timezone used for timestamps shown in the web UI."""
     timezone_name = os.environ.get("PC_AGENT_TIMEZONE", "Asia/Shanghai")
@@ -116,40 +103,6 @@ def _display_timezone():
         return ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
         return datetime.now().astimezone().tzinfo or timezone.utc
-
-
-def get_robot_pose():
-    """Read the robot pose from the same map TF used by navigation."""
-    connector = st.session_state.get("connector")
-    if connector is None:
-        return None
-
-    try:
-        transform = connector.get_transform(
-            target_frame="map",
-            source_frame="base_link",
-            timeout_sec=0.2,
-        )
-        translation = transform.transform.translation
-        rotation = transform.transform.rotation
-        x, y = float(translation.x), float(translation.y)
-        if not all(math.isfinite(value) for value in (x, y)):
-            return None
-        stamp = transform.header.stamp
-        timestamp = stamp.sec + stamp.nanosec / 1e9
-        # Use ROS time for freshness, including when use_sim_time is enabled.
-        now = connector.node.get_clock().now().nanoseconds / 1e9
-        age = now - timestamp
-        return {
-            "x": x,
-            "y": y,
-            "yaw": _yaw_from_quaternion(rotation),
-            # This is the PC Agent's local read time, not the ROS message stamp.
-            "local_time": datetime.now(_display_timezone()).strftime("%H:%M:%S"),
-            "stale": abs(age) > 3.0,
-        }
-    except Exception:
-        return None
 
 
 def _navigation_target(status: dict) -> str:
@@ -221,8 +174,9 @@ def _render_navigation_status(status: dict) -> None:
 
 
 def render_robot_status() -> None:
-    pose = get_robot_pose()
     localization_status = get_localization_status()
+    localization_state = localization_status.get("status")
+    pose = localization_status.get("pose")
     navigation_status = get_navigation_status()
     if _append_navigation_notice(navigation_status):
         # The notice belongs in the normal chat area, so redraw the full app
@@ -230,22 +184,23 @@ def render_robot_status() -> None:
         st.rerun()
 
     st.markdown("#### 小车实时位置")
-    columns = st.columns(4, gap="small")
-    columns[0].metric("X（map，米）", f"{pose['x']:.3f}" if pose else "--")
-    columns[1].metric("Y（map，米）", f"{pose['y']:.3f}" if pose else "--")
-    columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}" if pose else "--")
-    columns[3].metric("本地更新时间", pose["local_time"] if pose else "--")
-    localization_state = localization_status.get("status")
     if localization_state == "localizing":
-        st.info(localization_status.get("message") or "AMCL 全局定位中")
+        st.info("正在定位")
+    elif localization_state == "localized" and pose:
+        updated_at = datetime.fromtimestamp(
+            float(pose["updated_at"]),
+            _display_timezone(),
+        ).strftime("%H:%M:%S")
+        columns = st.columns(4, gap="small")
+        columns[0].metric("X（map，米）", f"{pose['x']:.3f}")
+        columns[1].metric("Y（map，米）", f"{pose['y']:.3f}")
+        columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}")
+        columns[3].metric("本地更新时间", updated_at)
     elif localization_state == "failed":
-        st.error(localization_status.get("message") or "AMCL 定位失败")
-    elif pose is None:
-        st.warning("等待 map 定位；请点击侧栏的“自动定位”")
-    elif pose["stale"]:
-        st.warning("定位数据已过期，显示的是最后已知位置")
-    elif localization_state == "waiting":
-        st.info("等待 AMCL 定位确认；请点击侧栏的“自动定位”")
+        detail = localization_status.get("message") or "AMCL 定位失败"
+        st.error(f"暂无有效位置：{detail}")
+    else:
+        st.info("暂无有效位置")
 
     _render_navigation_status(navigation_status)
 
@@ -262,6 +217,54 @@ def render_robot_status() -> None:
 @st.fragment(run_every="1s")
 def render_live_robot_status() -> None:
     render_robot_status()
+
+
+@st.fragment(run_every="1s")
+def render_localization_controls() -> None:
+    localization = get_localization_status()
+    navigation = get_navigation_status()
+    localization_busy = localization.get("status") == "localizing"
+    navigation_busy = navigation.get("status") in {"navigating", "canceling"}
+
+    control_columns = st.columns(2, gap="small")
+    locate_submitted = control_columns[0].button(
+        "自动定位",
+        key="start_global_localization",
+        type="primary",
+        use_container_width=True,
+        disabled=localization_busy or navigation_busy,
+    )
+    cancel_submitted = control_columns[1].button(
+        "取消定位",
+        key="cancel_global_localization",
+        use_container_width=True,
+        disabled=not localization_busy,
+    )
+
+    if locate_submitted:
+        try:
+            started = start_global_localization()
+        except LocalizationError as exc:
+            st.error(f"无法启动自动定位：{exc}")
+        else:
+            if started:
+                st.info("自动定位已启动，小车正在原地缓慢旋转")
+            else:
+                st.info("自动定位正在进行中")
+
+    if cancel_submitted:
+        try:
+            canceled = cancel_global_localization()
+        except LocalizationError as exc:
+            st.error(f"无法取消自动定位：{exc}")
+        else:
+            if canceled:
+                st.info("自动定位已取消，小车正在停止")
+            else:
+                st.info("当前没有正在进行的自动定位")
+
+    localization = get_localization_status()
+    st.caption(f"AMCL：{localization.get('label', '等待定位')}")
 
 
 # ── 状态与 Agent ───────────────────────────────────────────────────────────
@@ -485,31 +488,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### 定位")
-    sidebar_localization = get_localization_status()
-    sidebar_navigation = get_navigation_status()
-    localization_busy = sidebar_localization.get("status") == "localizing"
-    navigation_busy = sidebar_navigation.get("status") in {
-        "navigating",
-        "canceling",
-    }
-    locate_submitted = st.button(
-        "自动定位",
-        key="start_global_localization",
-        type="primary",
-        use_container_width=True,
-        disabled=localization_busy or navigation_busy,
-    )
-    st.caption(f"AMCL：{sidebar_localization.get('label', '等待定位')}")
-    if locate_submitted:
-        try:
-            started = start_global_localization()
-        except LocalizationError as exc:
-            st.error(f"无法启动自动定位：{exc}")
-        else:
-            if started:
-                st.info("自动定位已启动，小车正在原地缓慢旋转")
-            else:
-                st.info("自动定位正在进行中")
+    render_localization_controls()
 
     st.divider()
     st.markdown("### 坐标导航")

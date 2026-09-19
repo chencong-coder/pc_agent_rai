@@ -871,7 +871,7 @@ class NavigateToCoordinatesTool(BaseTool):
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
         "导航前必须已通过页面的自动定位按钮完成 AMCL 定位。"
-        "只需要 x(m)、y(m)；工具会根据小车当前位置自动计算到目标的朝向。"
+        "只需要 x(m)、y(m)；工具会根据最近确认的 AMCL 位姿计算到目标的朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
         "{x: -4.2, y: 2.97}。"
     )
@@ -901,20 +901,18 @@ class NavigateToCoordinatesTool(BaseTool):
         if not target.startswith("/"):
             target = "/" + target
         frame_id = self.frame_id.strip() or "map"
-        base_frame = self.base_frame.strip() or "base_link"
 
         try:
-            if self.localization_manager is not None:
-                self.localization_manager.require_localized()
-
-            # Sample the navigation start pose at goal-send time.
-            robot_tf = self.connector.get_transform(
-                target_frame=frame_id,
-                source_frame=base_frame,
-                timeout_sec=3.0,
-            )
-            robot_x = float(robot_tf.transform.translation.x)
-            robot_y = float(robot_tf.transform.translation.y)
+            if self.localization_manager is None:
+                raise LocalizationError("定位管理器尚未初始化")
+            localization = self.localization_manager.require_localized()
+            confirmed_pose = localization.get("pose")
+            if not confirmed_pose:
+                raise LocalizationError("没有已确认的 AMCL 位姿")
+            robot_x = float(confirmed_pose["x"])
+            robot_y = float(confirmed_pose["y"])
+            if not all(math.isfinite(value) for value in (robot_x, robot_y)):
+                raise LocalizationError("已确认的 AMCL 位姿无效")
             yaw = math.atan2(y - robot_y, x - robot_x)
             quat = _quaternion_from_yaw(yaw)
             goal = {
@@ -982,11 +980,7 @@ class NavigateToCoordinatesTool(BaseTool):
         except Exception as e:
             _mark_navigation_failed(x, y, f"导航失败：{e}")
             logger.error(f"导航失败: {e}")
-            return (
-                f"导航失败：无法读取当前小车位姿 map -> {base_frame}：{e}。"
-                "请确认定位系统正在发布 map -> odom -> base_link TF，"
-                "不需要手动输入起点坐标。"
-            )
+            return f"导航失败：{e}。"
 
 
 # ─── Tool: 取消导航 ──────────────────────────────────────────────────────
