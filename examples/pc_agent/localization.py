@@ -511,7 +511,7 @@ class LocalizationManager:
         return True
 
     def ensure_localized(self, force: bool = False) -> dict:
-        """Ensure AMCL is converged, running global localization if needed."""
+        """Confirm AMCL from the latest RViz initial pose without moving."""
         with self._operation_lock:
             if not force and self.is_localized():
                 return self.get_status()
@@ -528,45 +528,42 @@ class LocalizationManager:
             error: Optional[LocalizationError] = None
             localized = False
             try:
-                # Give an RViz message already in flight time to reach the
-                # callback before deciding to reset AMCL globally.
-                seed_wait_deadline = self._clock() + _INITIAL_POSE_WAIT_SEC
-                has_manual_seed = False
-                manual_seed = None
-                while self._clock() < seed_wait_deadline:
-                    if self._cancel_event.is_set():
-                        error = LocalizationCanceled("自动定位已取消")
-                        break
-                    now = self._clock()
-                    with self._state_lock:
-                        has_manual_seed = (
-                            self._latest_initial_pose is not None
-                        )
-                        if has_manual_seed:
-                            manual_seed = dict(self._latest_initial_pose)
-                    if has_manual_seed:
-                        break
-                    remaining = seed_wait_deadline - now
-                    self._sleep(min(self.command_period_sec, remaining))
+                with self._state_lock:
+                    manual_seed = (
+                        dict(self._latest_initial_pose)
+                        if self._latest_initial_pose is not None
+                        else None
+                    )
+
+                # The ROS callback is asynchronous. If the user published
+                # 2D Pose Estimate just before clicking, allow that message
+                # to arrive, but never rotate or globally reset AMCL.
+                if manual_seed is None:
+                    seed_wait_deadline = self._clock() + _INITIAL_POSE_WAIT_SEC
+                    while self._clock() < seed_wait_deadline:
+                        if self._cancel_event.is_set():
+                            error = LocalizationCanceled("自动定位已取消")
+                            break
+                        with self._state_lock:
+                            if self._latest_initial_pose is not None:
+                                manual_seed = dict(self._latest_initial_pose)
+                                break
+                        remaining = seed_wait_deadline - self._clock()
+                        self._sleep(min(self.command_period_sec, remaining))
 
                 if error is not None:
                     pass
-                elif has_manual_seed:
+                elif manual_seed is not None:
                     logger.info(
-                        "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，保留该初始位姿等待 AMCL 收敛",
+                        "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，AMCL 将从该位姿收敛",
                         _INITIAL_POSE_TOPIC,
                         manual_seed["x"],
                         manual_seed["y"],
                         manual_seed["yaw"],
                     )
                 else:
-                    # Without an initial pose from RViz, fall back to AMCL's
-                    # global particle reset and let the robot rotate.
-                    self.connector.service_call(
-                        _make_ros2_message({}),
-                        target=self.global_localization_service,
-                        msg_type="std_srvs/srv/Empty",
-                        timeout_sec=self.service_timeout_sec,
+                    error = LocalizationError(
+                        "未收到 /initialpose，请先在 RViz 发布 2D Pose Estimate"
                     )
 
                 if error is None:
@@ -578,7 +575,6 @@ class LocalizationManager:
                         if self.is_localized():
                             localized = True
                             break
-                        self._publish_rotation(self.angular_speed)
                         remaining = deadline - self._clock()
                         if remaining > 0.0:
                             self._sleep(min(self.command_period_sec, remaining))

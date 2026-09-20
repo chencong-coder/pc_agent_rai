@@ -88,7 +88,16 @@ class LocalizationQualityTests(unittest.TestCase):
         )
         return manager, connector, clock
 
-    def run_localization(self, manager, connector, clock, messages):
+    def run_localization(
+        self,
+        manager,
+        connector,
+        clock,
+        messages,
+        use_initial_pose=True,
+    ):
+        if use_initial_pose:
+            connector.initial_pose_callback(_pose_message(_covariance()))
         pending = iter(messages)
 
         def publish_next():
@@ -182,25 +191,24 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertEqual(connector.service_calls, [])
         self.assertEqual(connector.messages, [])
 
-    def test_global_localization_rotates_until_converged_then_stops(self):
+    def test_manual_initial_pose_confirms_without_rotation(self):
         clock = FakeClock()
         manager, connector, _ = self.make_manager(clock=clock, timeout_sec=2.0)
-        with patch("examples.pc_agent.localization._INITIAL_POSE_WAIT_SEC", 0.0):
-            status = self.run_localization(
-                manager,
-                connector,
-                clock,
-                [_pose_message(_covariance()) for _ in range(3)],
-            )
+        status = self.run_localization(
+            manager,
+            connector,
+            clock,
+            [_pose_message(_covariance()) for _ in range(3)],
+        )
 
         self.assertEqual(status["status"], "localized")
-        self.assertEqual(len(connector.service_calls), 1)
+        self.assertEqual(connector.service_calls, [])
         angular_commands = [
             message.payload["angular"]["z"]
             for message, _ in connector.messages
         ]
-        self.assertIn(0.2, angular_commands)
-        self.assertEqual(angular_commands[-1], 0.0)
+        self.assertTrue(angular_commands)
+        self.assertTrue(all(command == 0.0 for command in angular_commands))
 
     def test_manual_initial_pose_skips_global_reset(self):
         manager, connector, clock = self.make_manager(timeout_sec=2.0)
@@ -211,6 +219,7 @@ class LocalizationQualityTests(unittest.TestCase):
             connector,
             clock,
             [_pose_message(_covariance()) for _ in range(3)],
+            use_initial_pose=False,
         )
 
         self.assertEqual(status["status"], "localized")
@@ -256,12 +265,13 @@ class LocalizationQualityTests(unittest.TestCase):
             connector,
             clock,
             [_pose_message(_covariance()) for _ in range(3)],
+            use_initial_pose=False,
         )
 
         self.assertEqual(status["status"], "localized")
         self.assertEqual(connector.service_calls, [])
 
-    def test_global_localization_timeout_still_stops(self):
+    def test_missing_initial_pose_fails_without_rotation(self):
         manager, connector, _ = self.make_manager(timeout_sec=0.5)
 
         with patch(
@@ -273,7 +283,11 @@ class LocalizationQualityTests(unittest.TestCase):
 
         self.assertEqual(manager.get_status()["status"], "failed")
         self.assertIsNone(manager.get_status()["pose"])
-        self.assertEqual(connector.messages[-1][0].payload["angular"]["z"], 0.0)
+        self.assertTrue(connector.messages)
+        self.assertTrue(
+            all(message.payload["angular"]["z"] == 0.0
+                for message, _ in connector.messages)
+        )
 
     def test_cancel_global_localization_stops_and_returns_to_waiting(self):
         clock = FakeClock()

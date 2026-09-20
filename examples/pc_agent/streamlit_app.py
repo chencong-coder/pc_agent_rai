@@ -308,12 +308,7 @@ def initialize_agent() -> None:
     st.session_state.tools = tools
     st.session_state.connector = connector
     st.session_state.messages = [
-        AIMessage(
-            content=(
-                "已连接。请先在 RViz 发布正确的 2D Pose Estimate，"
-                "再点击自动定位，然后输入地图坐标或目标类别。"
-            )
-        )
+        AIMessage(content="已连接。请先自动定位，再输入地图坐标或目标类别。")
     ]
     st.session_state.tool_events = []
     st.session_state.last_audio_hash = None
