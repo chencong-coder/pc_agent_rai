@@ -26,7 +26,11 @@ from examples.pc_agent.localization import (
     get_localization_status,
     start_global_localization,
 )
-from examples.pc_agent.tools import get_navigation_status
+from examples.pc_agent.detection_selection import is_detection_navigation_request
+from examples.pc_agent.tools import (
+    get_detection_snapshot,
+    get_navigation_status,
+)
 
 
 st.set_page_config(
@@ -403,9 +407,33 @@ def invoke_agent(prompt: str) -> None:
                 tool_output,
                 AIMessage(content=str(tool_output.content)),
             ]}
+        elif (
+            get_detection_snapshot()
+            and is_detection_navigation_request(prompt)
+        ):
+            snapshot_tool = next(
+                tool for tool in st.session_state.tools
+                if tool.name == "navigate_to_detected_target"
+            )
+            call_id = f"snapshot-navigation-{uuid4().hex}"
+            tool_output = snapshot_tool.invoke({
+                "name": "navigate_to_detected_target",
+                "args": {"target": prompt},
+                "id": call_id,
+            })
+            result = {"messages": [
+                AIMessage(content="", tool_calls=[{
+                    "id": call_id,
+                    "name": "navigate_to_detected_target",
+                    "args": {"target": prompt},
+                }]),
+                tool_output,
+                AIMessage(content=str(tool_output.content)),
+            ]}
         else:
+            conversation = list(st.session_state.messages[-12:])
             result = st.session_state.agent.invoke(
-                {"messages": [HumanMessage(content=prompt)]}
+                {"messages": conversation}
             )
         collect_execution(record, result.get("messages", []))
     except Exception as exc:

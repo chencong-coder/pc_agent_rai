@@ -259,11 +259,10 @@ class LocalizationManager:
             "已使用 RViz 2D Pose Estimate 作为初始位姿",
         )
 
-    def _is_localized_locked(self, now: float) -> bool:
+    def _is_localized_locked(self, _now: float) -> bool:
         return (
             self._status == "localized"
             and self._last_pose_at is not None
-            and now - self._last_pose_at <= self.freshness_sec
             and self._stable_samples >= self.required_samples
             and self._confirmed_pose is not None
         )
@@ -425,12 +424,6 @@ class LocalizationManager:
                 self._last_pose_at is not None
                 and now - self._last_pose_at <= self.freshness_sec
             )
-            if self._status == "localized" and not self._is_localized_locked(now):
-                self._clear_confirmation_locked()
-                self._set_status_locked(
-                    "waiting",
-                    "AMCL 定位数据已过期，请重新点击“自动定位”",
-                )
             age = None
             if self._last_pose_at is not None:
                 age = max(0.0, now - self._last_pose_at)

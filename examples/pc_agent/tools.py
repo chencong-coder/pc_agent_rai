@@ -35,6 +35,7 @@ from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
 
 from .detect_socket_client import DetectBBox3DSocketClient
+from .detection_selection import CLASS_NAMES_ZH, select_detection_targets
 from .localization import LocalizationError
 
 logger = logging.getLogger(__name__)
@@ -58,21 +59,6 @@ _navigation_status: dict = {
     "result_code": None,
     "updated_at": 0.0,
 }
-
-_CLASS_NAMES_ZH = {
-    "bed": "床",
-    "chair": "椅子",
-    "sofa": "沙发",
-    "table": "桌子",
-    "desk": "书桌",
-    "cabinet": "柜子",
-    "door": "门",
-    "window": "窗户",
-    "bookshelf": "书架",
-    "toilet": "马桶",
-    "sink": "水槽",
-}
-
 
 def get_navigation_status() -> dict:
     """Return a thread-safe snapshot of the latest Nav2 navigation status."""
@@ -239,10 +225,10 @@ class DetectionStabilizer:
     def __init__(
         self,
         min_hits: int = 3,
-        window_size: int = 5,
-        window_seconds: float = 1.0,
+        window_size: int = 3,
+        window_seconds: float = 2.0,
         match_distance: float = 0.5,
-        max_missed_frames: int = 3,
+        max_missed_frames: int = 5,
     ):
         self.min_hits = min_hits
         self.window_size = window_size
@@ -339,8 +325,10 @@ class GetDetectionsTool(BaseTool):
     cache_max_age: float = Field(default=10.0, description="缓存有效时间(秒)")
     timeout_sec: float = Field(default=15.0)
     confirmation_hits: int = Field(default=3)
-    confirmation_window: int = Field(default=5)
+    confirmation_window: int = Field(default=3)
+    confirmation_window_seconds: float = Field(default=2.0)
     confirmation_distance: float = Field(default=0.5)
+    confirmation_max_missed_frames: int = Field(default=5)
 
     def _ensure_subscribed(self):
         import rclpy
@@ -460,7 +448,7 @@ class GetDetectionsTool(BaseTool):
             f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:"
         ]
         for i, d in enumerate(detections, 1):
-            display_name = _CLASS_NAMES_ZH.get(
+            display_name = CLASS_NAMES_ZH.get(
                 d.class_name.lower(), d.class_name
             )
             lines.append(
@@ -549,8 +537,9 @@ class GetDetectionsTool(BaseTool):
         stabilizer = DetectionStabilizer(
             min_hits=self.confirmation_hits,
             window_size=self.confirmation_window,
-            window_seconds=min(1.0, self.timeout_sec),
+            window_seconds=min(self.confirmation_window_seconds, self.timeout_sec),
             match_distance=self.confirmation_distance,
+            max_missed_frames=self.confirmation_max_missed_frames,
         )
         last_sequence = None
         latest_payload = None
@@ -794,9 +783,10 @@ class NavigateToDetectedTargetTool(BaseTool):
 
     name: str = "navigate_to_detected_target"
     description: str = (
-        "根据最近一次 get_detections 返回的已确认目标导航。"
-        "用户说'去左侧的椅子'、'去第一个目标'时使用本工具；"
-        "不要重新调用 get_detections，也不要读取最新检测。"
+        "目标导航必须首先调用本工具。它只使用最近一次 get_detections "
+        "保存的已确认快照，不会重新检测。用户说'去左侧的椅子'、"
+        "'找桌子'、'去第一个目标'时直接使用；仅当本工具明确返回没有"
+        "可用快照时，才允许调用 get_detections。"
     )
     args_schema: Type[NavigateToDetectedTargetInput] = NavigateToDetectedTargetInput
     navigate_tool: object = Field(..., exclude=True)
@@ -806,32 +796,7 @@ class NavigateToDetectedTargetTool(BaseTool):
         if not detections:
             return "没有可用的已确认检测快照，请先调用 get_detections。"
 
-        query = str(target).strip().lower()
-        selected = []
-        try:
-            index = int(query) - 1
-            if 0 <= index < len(detections):
-                selected = [detections[index]]
-        except ValueError:
-            pass
-
-        if not selected:
-            direction_aliases = {
-                "左边": "左侧",
-                "左面": "左侧",
-                "右边": "右侧",
-                "右面": "右侧",
-                "前面": "正前方",
-                "后面": "正后方",
-            }
-            normalized_query = direction_aliases.get(query, query)
-            selected = [
-                detection for detection in detections
-                if normalized_query in detection.class_name.lower()
-                or normalized_query in detection.direction.lower()
-                or query in detection.class_name.lower()
-                or query in detection.direction.lower()
-            ]
+        selected = select_detection_targets(detections, target)
         if len(selected) != 1:
             if not selected:
                 return f"最近的检测快照中没有匹配“{target}”的目标。"
@@ -842,7 +807,7 @@ class NavigateToDetectedTargetTool(BaseTool):
             "x": detection.x,
             "y": detection.y,
         })
-        class_name = _CLASS_NAMES_ZH.get(
+        class_name = CLASS_NAMES_ZH.get(
             detection.class_name.lower(), detection.class_name
         )
         return (

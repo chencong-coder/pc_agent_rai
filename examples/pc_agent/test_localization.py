@@ -177,7 +177,7 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertEqual(status["status"], "waiting")
         self.assertIsNone(status["pose"])
 
-    def test_confirmed_pose_expires_and_is_cleared(self):
+    def test_confirmed_pose_persists_while_amcl_is_quiet(self):
         manager, connector, clock = self.make_manager(timeout_sec=2.0)
         self.run_localization(
             manager,
@@ -188,8 +188,18 @@ class LocalizationQualityTests(unittest.TestCase):
 
         clock.now += 3.1
         status = manager.get_status()
-        self.assertEqual(status["status"], "waiting")
-        self.assertIsNone(status["pose"])
+        self.assertEqual(status["status"], "localized")
+        self.assertFalse(status["fresh"])
+        self.assertIsNotNone(status["pose"])
+
+        connector.callback(
+            _pose_message(_covariance(), x=1.5, y=2.5, yaw=0.5)
+        )
+        status = manager.get_status()
+        self.assertTrue(status["fresh"])
+        self.assertAlmostEqual(status["pose"]["x"], 1.5)
+        self.assertAlmostEqual(status["pose"]["y"], 2.5)
+        self.assertAlmostEqual(status["pose"]["yaw"], 0.5)
 
     def test_navigation_check_never_starts_global_localization(self):
         manager, connector, _ = self.make_manager()
