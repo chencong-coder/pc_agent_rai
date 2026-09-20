@@ -394,6 +394,7 @@ def invoke_agent(prompt: str) -> None:
             )
             call_id = f"cancel-{uuid4().hex}"
             tool_output = cancel_tool.invoke({
+                "type": "tool_call",
                 "name": "cancel_navigation",
                 "args": {},
                 "id": call_id,
@@ -417,6 +418,7 @@ def invoke_agent(prompt: str) -> None:
             )
             call_id = f"snapshot-navigation-{uuid4().hex}"
             tool_output = snapshot_tool.invoke({
+                "type": "tool_call",
                 "name": "navigate_to_detected_target",
                 "args": {"target": prompt},
                 "id": call_id,
