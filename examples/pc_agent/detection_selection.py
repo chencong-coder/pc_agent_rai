@@ -17,6 +17,32 @@ CLASS_NAMES_ZH = {
     "sink": "水槽",
 }
 
+CLASS_COUNTERS_ZH = {
+    "bed": "张",
+    "chair": "把",
+    "sofa": "个",
+    "table": "张",
+    "desk": "张",
+    "cabinet": "个",
+    "door": "扇",
+    "window": "扇",
+    "bookshelf": "个",
+    "toilet": "个",
+    "sink": "个",
+}
+
+DIRECTION_ORDER = (
+    "正前方",
+    "左前方",
+    "左侧",
+    "左后方",
+    "正后方",
+    "右后方",
+    "右侧",
+    "右前方",
+    "方向未知",
+)
+
 DIRECTION_ALIASES = {
     "正前方": "正前方",
     "左前方": "左前方",
@@ -57,6 +83,37 @@ def is_detection_navigation_request(prompt: str) -> bool:
         or any(word in query for word in DIRECTION_ALIASES)
         or has_numbered_target
     )
+
+
+def summarize_detection_directions(detections: list) -> str:
+    """Summarize exact object counts grouped by robot-relative direction."""
+    grouped: dict[str, dict[str, int]] = {}
+    for detection in detections:
+        direction = str(detection.direction or "方向未知")
+        class_name = str(detection.class_name).lower()
+        class_counts = grouped.setdefault(direction, {})
+        class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+    ordered_directions = [
+        direction for direction in DIRECTION_ORDER if direction in grouped
+    ]
+    ordered_directions.extend(
+        direction for direction in grouped if direction not in DIRECTION_ORDER
+    )
+
+    summaries = []
+    for direction in ordered_directions:
+        object_counts = []
+        for class_name, count in grouped[direction].items():
+            display_name = CLASS_NAMES_ZH.get(class_name, class_name)
+            counter = CLASS_COUNTERS_ZH.get(class_name, "个")
+            object_counts.append(f"{count}{counter}{display_name}")
+        objects_text = "、".join(object_counts)
+        if direction == "方向未知":
+            summaries.append(f"方向未知的目标有{objects_text}")
+        else:
+            summaries.append(f"小车{direction}有{objects_text}")
+    return "；".join(summaries)
 
 
 def select_detection_targets(detections: list, target: str) -> list:

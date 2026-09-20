@@ -35,8 +35,13 @@ from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
 
 from .detect_socket_client import DetectBBox3DSocketClient
-from .detection_selection import CLASS_NAMES_ZH, select_detection_targets
+from .detection_selection import (
+    CLASS_NAMES_ZH,
+    select_detection_targets,
+    summarize_detection_directions,
+)
 from .localization import LocalizationError
+from .navigation_heading import resolve_navigation_yaw
 
 logger = logging.getLogger(__name__)
 
@@ -445,7 +450,8 @@ class GetDetectionsTool(BaseTool):
         label = f"（过滤: {object_class}）" if object_class else ""
         lines = [
             f"检测到 {len(detections)} 个目标{label}"
-            f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:"
+            f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:",
+            f"方向汇总: {summarize_detection_directions(detections)}",
         ]
         for i, d in enumerate(detections, 1):
             display_name = CLASS_NAMES_ZH.get(
@@ -836,7 +842,8 @@ class NavigateToCoordinatesTool(BaseTool):
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
         "导航前必须已通过页面的自动定位按钮完成 AMCL 定位。"
-        "只需要 x(m)、y(m)；工具会根据最近确认的 AMCL 位姿计算到目标的朝向。"
+        "只需要 x(m)、y(m)；若定位使用了 RViz 2D Pose Estimate，目标朝向"
+        "沿用该 Pose 选择的 yaw，否则根据当前位置到目标计算朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
         "{x: -4.2, y: 2.97}。"
     )
@@ -878,7 +885,7 @@ class NavigateToCoordinatesTool(BaseTool):
             robot_y = float(confirmed_pose["y"])
             if not all(math.isfinite(value) for value in (robot_x, robot_y)):
                 raise LocalizationError("已确认的 AMCL 位姿无效")
-            yaw = math.atan2(y - robot_y, x - robot_x)
+            yaw, yaw_source = resolve_navigation_yaw(confirmed_pose, x, y)
             quat = _quaternion_from_yaw(yaw)
             goal = {
                 "pose": {
@@ -930,11 +937,21 @@ class NavigateToCoordinatesTool(BaseTool):
             if pending_future is not None:
                 _handle_navigation_done(action_id, pending_future)
 
+            if yaw_source == "initialpose":
+                heading_message = (
+                    "已使用 RViz 2D Pose Estimate 选定的朝向 "
+                    f"yaw={yaw:.2f}rad"
+                )
+            else:
+                heading_message = (
+                    f"已根据小车当前位置({robot_x:.2f}, {robot_y:.2f})"
+                    f"计算朝向 yaw={yaw:.2f}rad"
+                )
+
             return (
                 f"导航已开始 (ID: {action_id})。\n"
                 f"目标({frame_id}): x={x:.2f}m, y={y:.2f}m\n"
-                f"已根据小车当前位置({robot_x:.2f}, {robot_y:.2f})"
-                f"计算朝向 yaw={yaw:.2f}rad\n"
+                f"{heading_message}\n"
                 f"小车正在导航中，到达后会提示导航完成。"
             )
         except LocalizationError as e:

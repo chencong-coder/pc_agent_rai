@@ -224,6 +224,7 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertAlmostEqual(status["pose"]["x"], 1.0)
         self.assertAlmostEqual(status["pose"]["y"], 2.0)
         self.assertAlmostEqual(status["pose"]["yaw"], 0.25)
+        self.assertAlmostEqual(status["pose"]["initial_pose_yaw"], 0.25)
         self.assertEqual(clock.now, 0.0)
         self.assertEqual(connector.service_calls, [])
         angular_commands = [
@@ -261,6 +262,7 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertAlmostEqual(status["pose"]["x"], 1.2)
         self.assertAlmostEqual(status["pose"]["y"], 2.3)
         self.assertAlmostEqual(status["pose"]["yaw"], 0.4)
+        self.assertAlmostEqual(status["pose"]["initial_pose_yaw"], 0.25)
 
     def test_initial_pose_clears_previous_stable_samples(self):
         manager, connector, _ = self.make_manager(timeout_sec=2.0)
@@ -321,6 +323,7 @@ class LocalizationQualityTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "localized")
         self.assertEqual(len(connector.service_calls), 1)
+        self.assertIsNone(status["pose"]["initial_pose_yaw"])
         self.assertEqual(
             connector.service_calls[0][1]["target"],
             "/reinitialize_global_localization",

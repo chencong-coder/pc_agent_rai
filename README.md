@@ -21,7 +21,7 @@ PC (LLM) ←→ ROS 2 DDS ←→ Orin (Votenet + Nav2)
 - ✅ DeepSeek OpenAI 兼容接口 + 原生工具调用
 - ✅ TF 坐标自动变换 (`rslidar/velodyne` → `map`)
 - ✅ TF 转换失败时拒绝返回激光雷达坐标，避免发送错误导航目标
-- ✅ 导航只需要 `x、y`，根据小车当前位置自动计算到目标的朝向
+- ✅ 导航只需要 `x、y`，优先使用 2D Pose 选定朝向，否则自动计算朝向
 - ✅ Streamlit 执行记录按请求分组，显示工具原始返回和 Agent 回复
 - ✅ Docker 一键部署到 Orin
 
@@ -159,8 +159,9 @@ Nav2 目标。页面的“自动定位”会立即使用 Agent 已收到的最�
 你: 去 map 坐标 x=-4.2, y=2.97
 ```
 
-发送前，工具会读取最近一次已确认且仍有效的 AMCL 位姿，用目标点和该当前位置
-计算朝向：
+发送前，工具会读取最近一次已确认的 AMCL 位姿。如果本次定位使用了 RViz
+`2D Pose Estimate`，导航目标沿用用户画箭头时选定的 `yaw`。只有未使用
+`2D Pose Estimate`、由全局定位得到当前位置时，才计算朝向：
 
 ```text
 yaw = atan2(target_y - robot_y, target_x - robot_x)

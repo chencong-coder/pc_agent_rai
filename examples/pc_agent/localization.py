@@ -202,6 +202,7 @@ class LocalizationManager:
         self._message = "等待 AMCL 定位数据"
         self._stable_samples = 0
         self._last_pose_at: Optional[float] = None
+        self._initial_pose_yaw: Optional[float] = None
         self._confirmed_pose: Optional[dict] = None
         self._variances: tuple[Optional[float], Optional[float], Optional[float]] = (
             None,
@@ -235,6 +236,7 @@ class LocalizationManager:
 
     def _clear_confirmation_locked(self) -> None:
         self._stable_samples = 0
+        self._initial_pose_yaw = None
         self._confirmed_pose = None
 
     def _confirm_pose_locked(self, x: float, y: float, yaw: float) -> None:
@@ -242,11 +244,13 @@ class LocalizationManager:
             "x": x,
             "y": y,
             "yaw": yaw,
+            "initial_pose_yaw": self._initial_pose_yaw,
             "updated_at": self._wall_clock(),
         }
 
     def _confirm_initial_pose_locked(self, initial_pose: dict) -> None:
         self._localization_mode = "manual"
+        self._initial_pose_yaw = initial_pose["yaw"]
         self._last_pose_at = self._clock()
         self._stable_samples = self.required_samples
         self._confirm_pose_locked(

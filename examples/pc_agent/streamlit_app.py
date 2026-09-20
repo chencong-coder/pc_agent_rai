@@ -553,7 +553,7 @@ with st.sidebar:
                 st.error("X、Y 坐标必须是有限数字")
             else:
                 queue_prompt(
-                    f"导航到地图坐标：x={x:.3f} m，y={y:.3f} m（朝向按小车当前位置自动计算）"
+                    f"导航到地图坐标：x={x:.3f} m，y={y:.3f} m"
                 )
 
     st.divider()

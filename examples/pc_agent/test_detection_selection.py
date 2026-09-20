@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from .detection_selection import (
     is_detection_navigation_request,
     select_detection_targets,
+    summarize_detection_directions,
 )
 
 
@@ -50,6 +51,21 @@ class DetectionSelectionTests(unittest.TestCase):
         selected = select_detection_targets(detections, "去第二个目标")
 
         self.assertEqual(selected, [detections[1]])
+
+    def test_summarizes_counts_by_exact_direction_and_class(self):
+        detections = [
+            _detection("chair", "左前方"),
+            _detection("cabinet", "左前方"),
+            _detection("chair", "右侧"),
+            _detection("chair", "左前方"),
+        ]
+
+        summary = summarize_detection_directions(detections)
+
+        self.assertEqual(
+            summary,
+            "小车左前方有2把椅子、1个柜子；小车右侧有1把椅子",
+        )
 
 
 if __name__ == "__main__":
