@@ -55,12 +55,14 @@ class FakeConnector:
     def __init__(self):
         self.callback = None
         self.initial_pose_callback = None
+        self.initial_pose_options = None
         self.service_calls = []
         self.messages = []
 
     def register_callback(self, source, callback, **kwargs):
         if source == "/initialpose":
             self.initial_pose_callback = callback
+            self.initial_pose_options = kwargs
         else:
             self.callback = callback
         return "callback-1"
@@ -183,12 +185,13 @@ class LocalizationQualityTests(unittest.TestCase):
     def test_global_localization_rotates_until_converged_then_stops(self):
         clock = FakeClock()
         manager, connector, _ = self.make_manager(clock=clock, timeout_sec=2.0)
-        status = self.run_localization(
-            manager,
-            connector,
-            clock,
-            [_pose_message(_covariance()) for _ in range(3)],
-        )
+        with patch("examples.pc_agent.localization._INITIAL_POSE_WAIT_SEC", 0.0):
+            status = self.run_localization(
+                manager,
+                connector,
+                clock,
+                [_pose_message(_covariance()) for _ in range(3)],
+            )
 
         self.assertEqual(status["status"], "localized")
         self.assertEqual(len(connector.service_calls), 1)
@@ -213,10 +216,40 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertEqual(status["status"], "localized")
         self.assertEqual(connector.service_calls, [])
 
-    def test_stale_manual_initial_pose_does_not_skip_global_reset(self):
-        manager, connector, clock = self.make_manager(timeout_sec=2.0)
+    def test_initial_pose_clears_previous_stable_samples(self):
+        manager, connector, _ = self.make_manager(timeout_sec=2.0)
+        connector.callback(_pose_message(_covariance()))
+        connector.callback(_pose_message(_covariance()))
+        self.assertEqual(manager.get_status()["stable_samples"], 0)
+
         connector.initial_pose_callback(_pose_message(_covariance()))
-        clock.now = 6.0
+
+        self.assertEqual(manager.get_status()["status"], "waiting")
+        self.assertEqual(manager.get_status()["stable_samples"], 0)
+        self.assertIsNone(manager.get_status()["pose"])
+
+    def test_initial_pose_subscription_uses_explicit_compatible_qos(self):
+        _, connector, _ = self.make_manager()
+
+        if "auto_qos_matching" in connector.initial_pose_options:
+            self.assertFalse(connector.initial_pose_options["auto_qos_matching"])
+            self.assertEqual(
+                connector.initial_pose_options["qos_profile"].depth,
+                10,
+            )
+
+    def test_latest_manual_initial_pose_is_reused_on_retry(self):
+        manager, connector, clock = self.make_manager(timeout_sec=2.0)
+        connector.initial_pose_callback(
+            _pose_message(_covariance(), x=-4.9, y=2.8, yaw=-0.1)
+        )
+        connector.initial_pose_callback(
+            _pose_message(_covariance(), x=-4.95, y=2.91, yaw=-0.087)
+        )
+        clock.now = 31.0
+
+        self.assertAlmostEqual(manager._latest_initial_pose["x"], -4.95)
+        self.assertAlmostEqual(manager._latest_initial_pose["y"], 2.91)
 
         status = self.run_localization(
             manager,
@@ -226,7 +259,7 @@ class LocalizationQualityTests(unittest.TestCase):
         )
 
         self.assertEqual(status["status"], "localized")
-        self.assertEqual(len(connector.service_calls), 1)
+        self.assertEqual(connector.service_calls, [])
 
     def test_global_localization_timeout_still_stops(self):
         manager, connector, _ = self.make_manager(timeout_sec=0.5)

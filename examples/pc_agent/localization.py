@@ -29,7 +29,7 @@ _STATUS_LABELS = {
     "failed": "定位失败",
 }
 _INITIAL_POSE_TOPIC = "/initialpose"
-_INITIAL_POSE_FRESHNESS_SEC = 5.0
+_INITIAL_POSE_WAIT_SEC = 2.0
 
 _active_manager = None
 _active_manager_lock = Lock()
@@ -80,6 +80,27 @@ def _make_ros2_message(payload: dict):
     from rai.communication.ros2 import ROS2Message
 
     return ROS2Message(payload=payload)
+
+
+def _initial_pose_subscription_options() -> dict:
+    """Use a QoS compatible with RViz even before it publishes."""
+    try:
+        from rclpy.qos import (
+            DurabilityPolicy,
+            QoSProfile,
+            ReliabilityPolicy,
+        )
+    except ImportError:
+        # Keep the state helpers importable outside a ROS environment.
+        return {}
+    return {
+        "auto_qos_matching": False,
+        "qos_profile": QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        ),
+    }
 
 
 def _yaw_from_quaternion(rotation) -> float:
@@ -191,7 +212,7 @@ class LocalizationManager:
         self._background_lock = Lock()
         self._cancel_event = Event()
         self._background_thread: Optional[Thread] = None
-        self._last_initial_pose_at: Optional[float] = None
+        self._latest_initial_pose: Optional[dict] = None
         self._status = "waiting"
         self._message = "等待 AMCL 定位数据"
         self._stable_samples = 0
@@ -215,6 +236,7 @@ class LocalizationManager:
             self._on_initial_pose,
             raw=True,
             msg_type="geometry_msgs/msg/PoseWithCovarianceStamped",
+            **_initial_pose_subscription_options(),
         )
 
         global _active_manager
@@ -264,9 +286,47 @@ class LocalizationManager:
             self.observe_pose((), math.nan, math.nan, math.nan)
 
     def _on_initial_pose(self, message) -> None:
-        """Remember a recent explicit RViz/user seed for the next attempt."""
+        """Store the complete latest RViz pose for the next attempt."""
+        try:
+            payload = getattr(message, "payload", message)
+            pose_with_covariance = payload.pose
+            pose = pose_with_covariance.pose
+            position = pose.position
+            initial_pose = {
+                "x": float(position.x),
+                "y": float(position.y),
+                "yaw": _yaw_from_quaternion(pose.orientation),
+                "received_at": self._clock(),
+            }
+            if not all(
+                math.isfinite(initial_pose[key])
+                for key in ("x", "y", "yaw", "received_at")
+            ):
+                raise ValueError("初始位姿包含非有限数值")
+        except Exception as exc:
+            logger.warning("无法读取 %s 初始位姿: %s", _INITIAL_POSE_TOPIC, exc)
+            return
+
         with self._state_lock:
-            self._last_initial_pose_at = self._clock()
+            self._latest_initial_pose = initial_pose
+            self._clear_confirmation_locked()
+            logger.info(
+                "收到最新 %s：x=%.3f, y=%.3f, yaw=%.3f",
+                _INITIAL_POSE_TOPIC,
+                initial_pose["x"],
+                initial_pose["y"],
+                initial_pose["yaw"],
+            )
+            if self._status == "localized":
+                self._set_status_locked(
+                    "waiting",
+                    "收到新的 RViz 初始位姿，请点击“自动定位”确认",
+                )
+            elif self._status == "localizing":
+                self._set_status_locked(
+                    "localizing",
+                    "已收到 RViz 初始位姿，等待 AMCL 收敛",
+                )
 
     def observe_pose(
         self,
@@ -423,7 +483,7 @@ class LocalizationManager:
                 self._clear_confirmation_locked()
                 self._set_status_locked(
                     "localizing",
-                    "正在启动 AMCL 全局定位，小车将原地缓慢旋转",
+                    "正在读取最新初始位姿，准备 AMCL 定位",
                 )
             self._background_thread = Thread(
                 target=self._background_localization,
@@ -468,26 +528,40 @@ class LocalizationManager:
             error: Optional[LocalizationError] = None
             localized = False
             try:
-                with self._state_lock:
+                # Give an RViz message already in flight time to reach the
+                # callback before deciding to reset AMCL globally.
+                seed_wait_deadline = self._clock() + _INITIAL_POSE_WAIT_SEC
+                has_manual_seed = False
+                manual_seed = None
+                while self._clock() < seed_wait_deadline:
+                    if self._cancel_event.is_set():
+                        error = LocalizationCanceled("自动定位已取消")
+                        break
                     now = self._clock()
-                    has_manual_seed = (
-                        self._last_initial_pose_at is not None
-                        and 0.0
-                        <= now - self._last_initial_pose_at
-                        <= _INITIAL_POSE_FRESHNESS_SEC
-                    )
+                    with self._state_lock:
+                        has_manual_seed = (
+                            self._latest_initial_pose is not None
+                        )
+                        if has_manual_seed:
+                            manual_seed = dict(self._latest_initial_pose)
                     if has_manual_seed:
-                        self._last_initial_pose_at = None
+                        break
+                    remaining = seed_wait_deadline - now
+                    self._sleep(min(self.command_period_sec, remaining))
 
-                if has_manual_seed:
+                if error is not None:
+                    pass
+                elif has_manual_seed:
                     logger.info(
-                        "检测到最近发布的 %s，保留该初始位姿等待 AMCL 收敛",
+                        "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，保留该初始位姿等待 AMCL 收敛",
                         _INITIAL_POSE_TOPIC,
+                        manual_seed["x"],
+                        manual_seed["y"],
+                        manual_seed["yaw"],
                     )
                 else:
-                    # Do not trust a pose left over from a previous run. A
-                    # global reset is what makes the button genuinely usable
-                    # without first clicking 2D Pose Estimate in RViz.
+                    # Without an initial pose from RViz, fall back to AMCL's
+                    # global particle reset and let the robot rotate.
                     self.connector.service_call(
                         _make_ros2_message({}),
                         target=self.global_localization_service,
@@ -495,18 +569,19 @@ class LocalizationManager:
                         timeout_sec=self.service_timeout_sec,
                     )
 
-                deadline = self._clock() + self.timeout_sec
-                while self._clock() < deadline:
-                    if self._cancel_event.is_set():
-                        error = LocalizationCanceled("自动定位已取消")
-                        break
-                    if self.is_localized():
-                        localized = True
-                        break
-                    self._publish_rotation(self.angular_speed)
-                    remaining = deadline - self._clock()
-                    if remaining > 0.0:
-                        self._sleep(min(self.command_period_sec, remaining))
+                if error is None:
+                    deadline = self._clock() + self.timeout_sec
+                    while self._clock() < deadline:
+                        if self._cancel_event.is_set():
+                            error = LocalizationCanceled("自动定位已取消")
+                            break
+                        if self.is_localized():
+                            localized = True
+                            break
+                        self._publish_rotation(self.angular_speed)
+                        remaining = deadline - self._clock()
+                        if remaining > 0.0:
+                            self._sleep(min(self.command_period_sec, remaining))
 
                 if error is None and not localized:
                     localized = self.is_localized()
