@@ -237,15 +237,10 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertEqual(manager.get_status()["stable_samples"], 0)
         self.assertIsNone(manager.get_status()["pose"])
 
-    def test_initial_pose_subscription_uses_explicit_compatible_qos(self):
+    def test_initial_pose_subscription_matches_publisher_qos(self):
         _, connector, _ = self.make_manager()
 
-        if "auto_qos_matching" in connector.initial_pose_options:
-            self.assertFalse(connector.initial_pose_options["auto_qos_matching"])
-            self.assertEqual(
-                connector.initial_pose_options["qos_profile"].depth,
-                10,
-            )
+        self.assertTrue(connector.initial_pose_options["auto_qos_matching"])
 
     def test_latest_manual_initial_pose_is_reused_on_retry(self):
         manager, connector, clock = self.make_manager(timeout_sec=2.0)
@@ -271,23 +266,34 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertEqual(status["status"], "localized")
         self.assertEqual(connector.service_calls, [])
 
-    def test_missing_initial_pose_fails_without_rotation(self):
-        manager, connector, _ = self.make_manager(timeout_sec=0.5)
+    def test_missing_initial_pose_falls_back_to_global_rotation(self):
+        clock = FakeClock()
+        manager, connector, _ = self.make_manager(
+            clock=clock,
+            timeout_sec=0.5,
+        )
+        clock.on_sleep = lambda: connector.callback(
+            _pose_message(_covariance())
+        )
 
         with patch(
             "examples.pc_agent.localization._make_ros2_message",
             side_effect=lambda payload: SimpleNamespace(payload=payload),
         ):
-            with self.assertRaises(LocalizationError):
-                manager.ensure_localized()
+            status = manager.ensure_localized()
 
-        self.assertEqual(manager.get_status()["status"], "failed")
-        self.assertIsNone(manager.get_status()["pose"])
-        self.assertTrue(connector.messages)
-        self.assertTrue(
-            all(message.payload["angular"]["z"] == 0.0
-                for message, _ in connector.messages)
+        self.assertEqual(status["status"], "localized")
+        self.assertEqual(len(connector.service_calls), 1)
+        self.assertEqual(
+            connector.service_calls[0][1]["target"],
+            "/reinitialize_global_localization",
         )
+        angular_commands = [
+            message.payload["angular"]["z"]
+            for message, _ in connector.messages
+        ]
+        self.assertIn(0.2, angular_commands)
+        self.assertEqual(angular_commands[-1], 0.0)
 
     def test_cancel_global_localization_stops_and_returns_to_waiting(self):
         clock = FakeClock()

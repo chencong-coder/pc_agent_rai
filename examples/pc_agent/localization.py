@@ -83,24 +83,8 @@ def _make_ros2_message(payload: dict):
 
 
 def _initial_pose_subscription_options() -> dict:
-    """Use a QoS compatible with RViz even before it publishes."""
-    try:
-        from rclpy.qos import (
-            DurabilityPolicy,
-            QoSProfile,
-            ReliabilityPolicy,
-        )
-    except ImportError:
-        # Keep the state helpers importable outside a ROS environment.
-        return {}
-    return {
-        "auto_qos_matching": False,
-        "qos_profile": QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-        ),
-    }
+    """Match RViz's QoS so transient-local initial poses can be replayed."""
+    return {"auto_qos_matching": True}
 
 
 def _yaw_from_quaternion(rotation) -> float:
@@ -213,6 +197,7 @@ class LocalizationManager:
         self._cancel_event = Event()
         self._background_thread: Optional[Thread] = None
         self._latest_initial_pose: Optional[dict] = None
+        self._localization_mode: Optional[str] = None
         self._status = "waiting"
         self._message = "等待 AMCL 定位数据"
         self._stable_samples = 0
@@ -353,6 +338,10 @@ class LocalizationManager:
         )
 
         with self._state_lock:
+            if self._status == "localizing" and self._localization_mode == "pending":
+                # Do not confirm stale AMCL data while deciding whether this
+                # attempt uses RViz's seed or global rotating localization.
+                return
             if (
                 self._last_pose_at is None
                 or now - self._last_pose_at > self.freshness_sec
@@ -371,17 +360,27 @@ class LocalizationManager:
                         f"AMCL 已连续 {self.required_samples} 帧收敛",
                     )
                 else:
+                    mode_label = (
+                        "AMCL 初始位姿收敛中"
+                        if self._localization_mode == "manual"
+                        else "AMCL 全局定位中"
+                    )
                     self._set_status_locked(
                         "localizing",
-                        "AMCL 全局定位中"
-                        f"（稳定样本 {self._stable_samples}/{self.required_samples}）",
+                        f"{mode_label}（稳定样本 "
+                        f"{self._stable_samples}/{self.required_samples}）",
                     )
             elif self._status == "localizing":
                 self._stable_samples = 0
                 self._confirmed_pose = None
+                mode_label = (
+                    "AMCL 初始位姿收敛中"
+                    if self._localization_mode == "manual"
+                    else "AMCL 全局定位中"
+                )
                 self._set_status_locked(
                     "localizing",
-                    "AMCL 全局定位中（位姿质量尚未收敛）",
+                    f"{mode_label}（位姿质量尚未收敛）",
                 )
             elif self._status == "localized" and converged:
                 self._stable_samples = self.required_samples
@@ -481,6 +480,8 @@ class LocalizationManager:
             self._cancel_event.clear()
             with self._state_lock:
                 self._clear_confirmation_locked()
+                self._last_pose_at = None
+                self._localization_mode = "pending"
                 self._set_status_locked(
                     "localizing",
                     "正在读取最新初始位姿，准备 AMCL 定位",
@@ -511,7 +512,7 @@ class LocalizationManager:
         return True
 
     def ensure_localized(self, force: bool = False) -> dict:
-        """Confirm AMCL from the latest RViz initial pose without moving."""
+        """Confirm AMCL from RViz or fall back to global rotating localization."""
         with self._operation_lock:
             if not force and self.is_localized():
                 return self.get_status()
@@ -520,9 +521,11 @@ class LocalizationManager:
 
             with self._state_lock:
                 self._clear_confirmation_locked()
+                self._last_pose_at = None
+                self._localization_mode = "pending"
                 self._set_status_locked(
                     "localizing",
-                    "正在定位，小车将原地缓慢旋转",
+                    "正在定位，等待 AMCL 收敛",
                 )
 
             error: Optional[LocalizationError] = None
@@ -537,7 +540,7 @@ class LocalizationManager:
 
                 # The ROS callback is asynchronous. If the user published
                 # 2D Pose Estimate just before clicking, allow that message
-                # to arrive, but never rotate or globally reset AMCL.
+                # to arrive before falling back to global localization.
                 if manual_seed is None:
                     seed_wait_deadline = self._clock() + _INITIAL_POSE_WAIT_SEC
                     while self._clock() < seed_wait_deadline:
@@ -554,6 +557,9 @@ class LocalizationManager:
                 if error is not None:
                     pass
                 elif manual_seed is not None:
+                    with self._state_lock:
+                        self._localization_mode = "manual"
+                        self._last_pose_at = None
                     logger.info(
                         "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，AMCL 将从该位姿收敛",
                         _INITIAL_POSE_TOPIC,
@@ -562,8 +568,18 @@ class LocalizationManager:
                         manual_seed["yaw"],
                     )
                 else:
-                    error = LocalizationError(
-                        "未收到 /initialpose，请先在 RViz 发布 2D Pose Estimate"
+                    with self._state_lock:
+                        self._localization_mode = "global"
+                        self._last_pose_at = None
+                    logger.info(
+                        "未收到最新 %s，调用 AMCL 全局定位并开始原地旋转",
+                        _INITIAL_POSE_TOPIC,
+                    )
+                    self.connector.service_call(
+                        _make_ros2_message({}),
+                        target=self.global_localization_service,
+                        msg_type="std_srvs/srv/Empty",
+                        timeout_sec=self.service_timeout_sec,
                     )
 
                 if error is None:
@@ -575,6 +591,8 @@ class LocalizationManager:
                         if self.is_localized():
                             localized = True
                             break
+                        if manual_seed is None:
+                            self._publish_rotation(self.angular_speed)
                         remaining = deadline - self._clock()
                         if remaining > 0.0:
                             self._sleep(min(self.command_period_sec, remaining))
@@ -606,10 +624,13 @@ class LocalizationManager:
             if isinstance(error, LocalizationCanceled):
                 with self._state_lock:
                     self._clear_confirmation_locked()
+                    self._localization_mode = None
                     self._set_status_locked("waiting", str(error))
                 raise error
             if error is not None:
                 self._mark_failed(str(error))
+                with self._state_lock:
+                    self._localization_mode = None
                 raise error
 
             return self.get_status()

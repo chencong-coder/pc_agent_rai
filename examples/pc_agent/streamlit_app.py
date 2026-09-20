@@ -248,7 +248,7 @@ def render_localization_controls() -> None:
             st.error(f"无法启动自动定位：{exc}")
         else:
             if started:
-                st.info("自动定位已启动，正在读取最新初始位姿")
+                st.info("自动定位已启动：有 2D Pose Estimate 时直接使用，否则执行旋转搜索")
             else:
                 st.info("自动定位正在进行中")
 
