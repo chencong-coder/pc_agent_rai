@@ -101,6 +101,8 @@ class LocalizationQualityTests(unittest.TestCase):
         pending = iter(messages)
 
         def publish_next():
+            if manager._localization_mode == "pending":
+                return
             message = next(pending, None)
             if message is not None:
                 connector.callback(message)
@@ -141,7 +143,13 @@ class LocalizationQualityTests(unittest.TestCase):
             _pose_message(_covariance(), x=5.0, y=6.0, yaw=0.7),
         ]
 
-        status = self.run_localization(manager, connector, clock, messages)
+        status = self.run_localization(
+            manager,
+            connector,
+            clock,
+            messages,
+            use_initial_pose=False,
+        )
 
         self.assertEqual(status["status"], "localized")
         self.assertEqual(status["stable_samples"], 3)
@@ -156,6 +164,7 @@ class LocalizationQualityTests(unittest.TestCase):
             connector,
             clock,
             [_pose_message(_covariance()) for _ in range(3)],
+            use_initial_pose=False,
         )
 
         connector.callback(
@@ -198,10 +207,14 @@ class LocalizationQualityTests(unittest.TestCase):
             manager,
             connector,
             clock,
-            [_pose_message(_covariance()) for _ in range(3)],
+            [],
         )
 
         self.assertEqual(status["status"], "localized")
+        self.assertAlmostEqual(status["pose"]["x"], 1.0)
+        self.assertAlmostEqual(status["pose"]["y"], 2.0)
+        self.assertAlmostEqual(status["pose"]["yaw"], 0.25)
+        self.assertEqual(clock.now, 0.0)
         self.assertEqual(connector.service_calls, [])
         angular_commands = [
             message.payload["angular"]["z"]
@@ -218,12 +231,26 @@ class LocalizationQualityTests(unittest.TestCase):
             manager,
             connector,
             clock,
-            [_pose_message(_covariance()) for _ in range(3)],
+            [],
             use_initial_pose=False,
         )
 
         self.assertEqual(status["status"], "localized")
         self.assertEqual(connector.service_calls, [])
+
+    def test_manual_pose_stays_valid_while_amcl_covariance_settles(self):
+        manager, connector, clock = self.make_manager(timeout_sec=2.0)
+        status = self.run_localization(manager, connector, clock, [])
+
+        connector.callback(
+            _pose_message(_covariance(x=2.0, y=2.0), x=1.2, y=2.3, yaw=0.4)
+        )
+
+        status = manager.get_status()
+        self.assertEqual(status["status"], "localized")
+        self.assertAlmostEqual(status["pose"]["x"], 1.2)
+        self.assertAlmostEqual(status["pose"]["y"], 2.3)
+        self.assertAlmostEqual(status["pose"]["yaw"], 0.4)
 
     def test_initial_pose_clears_previous_stable_samples(self):
         manager, connector, _ = self.make_manager(timeout_sec=2.0)
@@ -259,7 +286,7 @@ class LocalizationQualityTests(unittest.TestCase):
             manager,
             connector,
             clock,
-            [_pose_message(_covariance()) for _ in range(3)],
+            [],
             use_initial_pose=False,
         )
 

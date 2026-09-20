@@ -245,6 +245,20 @@ class LocalizationManager:
             "updated_at": self._wall_clock(),
         }
 
+    def _confirm_initial_pose_locked(self, initial_pose: dict) -> None:
+        self._localization_mode = "manual"
+        self._last_pose_at = self._clock()
+        self._stable_samples = self.required_samples
+        self._confirm_pose_locked(
+            initial_pose["x"],
+            initial_pose["y"],
+            initial_pose["yaw"],
+        )
+        self._set_status_locked(
+            "localized",
+            "已使用 RViz 2D Pose Estimate 作为初始位姿",
+        )
+
     def _is_localized_locked(self, now: float) -> bool:
         return (
             self._status == "localized"
@@ -308,10 +322,7 @@ class LocalizationManager:
                     "收到新的 RViz 初始位姿，请点击“自动定位”确认",
                 )
             elif self._status == "localizing":
-                self._set_status_locked(
-                    "localizing",
-                    "已收到 RViz 初始位姿，等待 AMCL 收敛",
-                )
+                self._confirm_initial_pose_locked(initial_pose)
 
     def observe_pose(
         self,
@@ -383,6 +394,16 @@ class LocalizationManager:
                     f"{mode_label}（位姿质量尚未收敛）",
                 )
             elif self._status == "localized" and converged:
+                self._stable_samples = self.required_samples
+                self._confirm_pose_locked(x, y, yaw)
+            elif (
+                self._status == "localized"
+                and self._localization_mode == "manual"
+                and pose_is_valid
+            ):
+                # An explicit RViz pose is already an accepted starting pose.
+                # Continue refreshing the live position without requiring the
+                # global-localization covariance gate.
                 self._stable_samples = self.required_samples
                 self._confirm_pose_locked(x, y, yaw)
             elif self._status == "localized":
@@ -558,10 +579,9 @@ class LocalizationManager:
                     pass
                 elif manual_seed is not None:
                     with self._state_lock:
-                        self._localization_mode = "manual"
-                        self._last_pose_at = None
+                        self._confirm_initial_pose_locked(manual_seed)
                     logger.info(
-                        "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，AMCL 将从该位姿收敛",
+                        "读取最新 %s：x=%.3f, y=%.3f, yaw=%.3f，直接作为定位起点",
                         _INITIAL_POSE_TOPIC,
                         manual_seed["x"],
                         manual_seed["y"],
