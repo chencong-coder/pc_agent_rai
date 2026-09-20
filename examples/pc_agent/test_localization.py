@@ -54,11 +54,15 @@ class FakeClock:
 class FakeConnector:
     def __init__(self):
         self.callback = None
+        self.initial_pose_callback = None
         self.service_calls = []
         self.messages = []
 
     def register_callback(self, source, callback, **kwargs):
-        self.callback = callback
+        if source == "/initialpose":
+            self.initial_pose_callback = callback
+        else:
+            self.callback = callback
         return "callback-1"
 
     def service_call(self, message, **kwargs):
@@ -194,6 +198,35 @@ class LocalizationQualityTests(unittest.TestCase):
         ]
         self.assertIn(0.2, angular_commands)
         self.assertEqual(angular_commands[-1], 0.0)
+
+    def test_manual_initial_pose_skips_global_reset(self):
+        manager, connector, clock = self.make_manager(timeout_sec=2.0)
+        connector.initial_pose_callback(_pose_message(_covariance()))
+
+        status = self.run_localization(
+            manager,
+            connector,
+            clock,
+            [_pose_message(_covariance()) for _ in range(3)],
+        )
+
+        self.assertEqual(status["status"], "localized")
+        self.assertEqual(connector.service_calls, [])
+
+    def test_stale_manual_initial_pose_does_not_skip_global_reset(self):
+        manager, connector, clock = self.make_manager(timeout_sec=2.0)
+        connector.initial_pose_callback(_pose_message(_covariance()))
+        clock.now = 6.0
+
+        status = self.run_localization(
+            manager,
+            connector,
+            clock,
+            [_pose_message(_covariance()) for _ in range(3)],
+        )
+
+        self.assertEqual(status["status"], "localized")
+        self.assertEqual(len(connector.service_calls), 1)
 
     def test_global_localization_timeout_still_stops(self):
         manager, connector, _ = self.make_manager(timeout_sec=0.5)

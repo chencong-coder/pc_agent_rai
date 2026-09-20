@@ -28,6 +28,8 @@ _STATUS_LABELS = {
     "localized": "已定位",
     "failed": "定位失败",
 }
+_INITIAL_POSE_TOPIC = "/initialpose"
+_INITIAL_POSE_FRESHNESS_SEC = 5.0
 
 _active_manager = None
 _active_manager_lock = Lock()
@@ -158,7 +160,10 @@ class LocalizationManager:
     ):
         if required_samples < 1:
             raise ValueError("required_samples must be at least 1")
-        if timeout_sec <= 0.0 or freshness_sec <= 0.0:
+        if (
+            timeout_sec <= 0.0
+            or freshness_sec <= 0.0
+        ):
             raise ValueError("localization timeouts must be positive")
         if command_period_sec <= 0.0:
             raise ValueError("command_period_sec must be positive")
@@ -186,6 +191,7 @@ class LocalizationManager:
         self._background_lock = Lock()
         self._cancel_event = Event()
         self._background_thread: Optional[Thread] = None
+        self._last_initial_pose_at: Optional[float] = None
         self._status = "waiting"
         self._message = "等待 AMCL 定位数据"
         self._stable_samples = 0
@@ -201,6 +207,12 @@ class LocalizationManager:
         self._callback_id = self.connector.register_callback(
             self.pose_topic,
             self._on_amcl_pose,
+            raw=True,
+            msg_type="geometry_msgs/msg/PoseWithCovarianceStamped",
+        )
+        self._initial_pose_callback_id = self.connector.register_callback(
+            _INITIAL_POSE_TOPIC,
+            self._on_initial_pose,
             raw=True,
             msg_type="geometry_msgs/msg/PoseWithCovarianceStamped",
         )
@@ -250,6 +262,11 @@ class LocalizationManager:
         except Exception as exc:
             logger.warning("无法读取 %s 位姿: %s", self.pose_topic, exc)
             self.observe_pose((), math.nan, math.nan, math.nan)
+
+    def _on_initial_pose(self, message) -> None:
+        """Remember a recent explicit RViz/user seed for the next attempt."""
+        with self._state_lock:
+            self._last_initial_pose_at = self._clock()
 
     def observe_pose(
         self,
@@ -445,18 +462,38 @@ class LocalizationManager:
                 self._clear_confirmation_locked()
                 self._set_status_locked(
                     "localizing",
-                    "正在启动 AMCL 全局定位，小车将原地缓慢旋转",
+                    "正在定位，小车将原地缓慢旋转",
                 )
 
             error: Optional[LocalizationError] = None
             localized = False
             try:
-                self.connector.service_call(
-                    _make_ros2_message({}),
-                    target=self.global_localization_service,
-                    msg_type="std_srvs/srv/Empty",
-                    timeout_sec=self.service_timeout_sec,
-                )
+                with self._state_lock:
+                    now = self._clock()
+                    has_manual_seed = (
+                        self._last_initial_pose_at is not None
+                        and 0.0
+                        <= now - self._last_initial_pose_at
+                        <= _INITIAL_POSE_FRESHNESS_SEC
+                    )
+                    if has_manual_seed:
+                        self._last_initial_pose_at = None
+
+                if has_manual_seed:
+                    logger.info(
+                        "检测到最近发布的 %s，保留该初始位姿等待 AMCL 收敛",
+                        _INITIAL_POSE_TOPIC,
+                    )
+                else:
+                    # Do not trust a pose left over from a previous run. A
+                    # global reset is what makes the button genuinely usable
+                    # without first clicking 2D Pose Estimate in RViz.
+                    self.connector.service_call(
+                        _make_ros2_message({}),
+                        target=self.global_localization_service,
+                        msg_type="std_srvs/srv/Empty",
+                        timeout_sec=self.service_timeout_sec,
+                    )
 
                 deadline = self._clock() + self.timeout_sec
                 while self._clock() < deadline:
@@ -470,6 +507,7 @@ class LocalizationManager:
                     remaining = deadline - self._clock()
                     if remaining > 0.0:
                         self._sleep(min(self.command_period_sec, remaining))
+
                 if error is None and not localized:
                     localized = self.is_localized()
                 if error is None and not localized:
