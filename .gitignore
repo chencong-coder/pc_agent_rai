@@ -180,3 +180,8 @@ src/rai_interfaces
 
 # Demo assets
 demo_assets/
+
+# Local patent artifacts
+/create_patent_doc.py
+/patent_figures/
+/人机交互小车专利技术交底书.docx
