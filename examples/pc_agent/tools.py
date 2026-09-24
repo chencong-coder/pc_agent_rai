@@ -29,7 +29,7 @@ from threading import Lock
 from typing import Optional, Type
 
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from rai.communication.ros2 import ROS2Message
 from rai.communication.ros2.connectors import ROS2Connector
@@ -37,11 +37,20 @@ from rai.communication.ros2.connectors import ROS2Connector
 from .detect_socket_client import DetectBBox3DSocketClient
 from .detection_selection import (
     CLASS_NAMES_ZH,
+    direction_from_robot_frame,
+    select_one_to_one_matches,
     select_detection_targets,
     summarize_detection_directions,
 )
+from .detection_snapshot import DetectionSnapshotStore
 from .localization import LocalizationError
-from .navigation_heading import resolve_navigation_yaw
+from .navigation_heading import (
+    calculate_detection_standoff,
+    generate_standoff_candidates,
+    normalize_costmap,
+    resolve_navigation_yaw,
+    select_costmap_candidate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +59,7 @@ _detection_cache: dict = {}
 _detection_lock = Lock()
 _socket_clients: dict[tuple[str, int], DetectBBox3DSocketClient] = {}
 _socket_clients_lock = Lock()
-_detection_snapshot_lock = Lock()
-_last_confirmed_detections: list = []
+_detection_snapshots = DetectionSnapshotStore()
 _active_navigation_action_id: Optional[str] = None
 _navigation_action_lock = Lock()
 _navigation_status: dict = {
@@ -142,6 +150,22 @@ def _handle_navigation_done(action_id: str, future) -> None:
         result_code,
         ("failed", f"导航结束，Nav2 状态码 {result_code}"),
     )
+    if status == "failed":
+        result = getattr(response, "result", None)
+        error_code = getattr(result, "error_code", None)
+        error_message = str(getattr(result, "error_msg", "") or "").strip()
+        details = []
+        if error_code not in (None, 0):
+            details.append(f"error_code={error_code}")
+        if error_message:
+            details.append(error_message)
+        if details:
+            message = f"{message}（{'；'.join(details)}）"
+        else:
+            message = (
+                f"{message}（Action 状态码 {result_code}；Nav2 未返回详细原因，"
+                "请查看 planner_server/controller_server 日志）"
+            )
     _finish_navigation(action_id, status, message, result_code)
 
 
@@ -168,20 +192,28 @@ class DetectionObject(BaseModel):
     x: float = Field(description="x (m)")
     y: float = Field(description="y (m)")
     z: float = Field(description="z (m)")
+    size_x: float = Field(default=0.0, description="检测框 x 尺寸 (m)")
+    size_y: float = Field(default=0.0, description="检测框 y 尺寸 (m)")
     confidence: float = Field(default=0.0)
     direction: str = Field(default="方向未知")
     confirmed_hits: int = Field(default=1)
 
 
-def _set_detection_snapshot(detections: list[DetectionObject]) -> None:
-    global _last_confirmed_detections
-    with _detection_snapshot_lock:
-        _last_confirmed_detections = [d.model_copy() for d in detections]
-
-
 def get_detection_snapshot() -> list[DetectionObject]:
-    with _detection_snapshot_lock:
-        return [d.model_copy() for d in _last_confirmed_detections]
+    state = _detection_snapshots.read()
+    if state["status"] != "confirmed":
+        return []
+    return state["detections"]
+
+
+def get_latest_detection_round() -> dict:
+    """Return the latest detection call and its matching structured snapshot."""
+    return _detection_snapshots.read()
+
+
+def clear_detection_history() -> None:
+    """Clear both the latest detection conversation state and its snapshot."""
+    _detection_snapshots.reset()
 
 
 class DetectionTransformError(RuntimeError):
@@ -218,6 +250,8 @@ class DetectionTrack:
             x=median([d.x for d in recent]),
             y=median([d.y for d in recent]),
             z=median([d.z for d in recent]),
+            size_x=median([d.size_x for d in recent]),
+            size_y=median([d.size_y for d in recent]),
             confidence=sum(d.confidence for d in recent) / len(recent),
             direction=self.last_detection.direction,
             confirmed_hits=len(self.samples),
@@ -264,9 +298,8 @@ class DetectionStabilizer:
                 if distance <= self.match_distance:
                     candidates.append((distance, track_index, detection_index))
 
-        for _, track_index, detection_index in sorted(candidates):
-            if detection_index not in unmatched:
-                continue
+        matches = select_one_to_one_matches(candidates)
+        for _, track_index, detection_index in matches:
             track = self.tracks[track_index]
             track.add(
                 detections[detection_index], timestamp, self.window_size
@@ -375,6 +408,8 @@ class GetDetectionsTool(BaseTool):
                 x = float(best.pose.pose.position.x)
                 y = float(best.pose.pose.position.y)
                 z = float(best.pose.pose.position.z)
+                size_x = float(getattr(det.bbox.size, "x", 0.0))
+                size_y = float(getattr(det.bbox.size, "y", 0.0))
 
                 # 过滤无效检测: score=0, class 为空, nan/inf 坐标
                 if score <= 0.0 or not class_id:
@@ -389,6 +424,8 @@ class GetDetectionsTool(BaseTool):
                 detections.append(DetectionObject(
                     class_name=class_id,
                     x=x, y=y, z=z,
+                    size_x=size_x if math.isfinite(size_x) else 0.0,
+                    size_y=size_y if math.isfinite(size_y) else 0.0,
                     confidence=score,
                 ))
         return detections
@@ -400,10 +437,13 @@ class GetDetectionsTool(BaseTool):
             class_id = str(det.get("class_id", "")).strip()
             score = float(det.get("score", 0.0) or 0.0)
             center = det.get("center", {}) or {}
+            size = det.get("size", {}) or {}
 
             x = float(center.get("x", 0.0) or 0.0)
             y = float(center.get("y", 0.0) or 0.0)
             z = float(center.get("z", 0.0) or 0.0)
+            size_x = float(size.get("x", 0.0) or 0.0)
+            size_y = float(size.get("y", 0.0) or 0.0)
 
             if score <= 0.0 or not class_id:
                 continue
@@ -417,6 +457,8 @@ class GetDetectionsTool(BaseTool):
             detections.append(DetectionObject(
                 class_name=class_id,
                 x=x, y=y, z=z,
+                size_x=size_x if math.isfinite(size_x) else 0.0,
+                size_y=size_y if math.isfinite(size_y) else 0.0,
                 confidence=score,
                 direction=str(
                     det.get("relative_direction", det.get("direction", "方向未知"))
@@ -425,14 +467,47 @@ class GetDetectionsTool(BaseTool):
             ))
         return detections
 
+    @staticmethod
+    def _payload_timestamp(payload: dict, fallback: float | None = None) -> float:
+        """Use the producer stamp when valid, otherwise local receive time."""
+        stamp = payload.get("stamp", {}) or {}
+        try:
+            candidate = float(stamp.get("sec", 0.0)) + (
+                float(stamp.get("nanosec", 0.0)) / 1e9
+            )
+        except (TypeError, ValueError):
+            candidate = 0.0
+        if math.isfinite(candidate) and candidate > 0.0:
+            return candidate
+        local_time = float(fallback if fallback is not None else time.time())
+        return local_time if math.isfinite(local_time) else time.time()
+
+    @staticmethod
+    def _message_timestamp(message) -> float:
+        """Read a ROS header stamp, falling back to the local wall clock."""
+        header = getattr(message, "header", None)
+        stamp = getattr(header, "stamp", None)
+        try:
+            candidate = float(getattr(stamp, "sec", 0.0)) + (
+                float(getattr(stamp, "nanosec", 0.0)) / 1e9
+            )
+        except (TypeError, ValueError):
+            candidate = 0.0
+        return candidate if math.isfinite(candidate) and candidate > 0.0 else time.time()
+
     def _format_detections(
         self,
+        round_id: int,
         detections: list[DetectionObject],
         object_class: Optional[str] = None,
         coordinate_frame: str = "map",
         snapshot_detections: Optional[list[DetectionObject]] = None,
     ) -> str:
-        snapshot = snapshot_detections or detections
+        snapshot = (
+            list(snapshot_detections)
+            if snapshot_detections is not None
+            else list(detections)
+        )
         if object_class:
             detections = [
                 d for d in detections
@@ -443,9 +518,11 @@ class GetDetectionsTool(BaseTool):
             msg = "当前未检测到任何目标物体。"
             if object_class:
                 msg = f"当前未检测到类别为 '{object_class}' 的目标。"
+            if snapshot:
+                _detection_snapshots.confirm(round_id, snapshot, msg)
+            else:
+                _detection_snapshots.fail(round_id, msg)
             return msg
-
-        _set_detection_snapshot(snapshot)
 
         label = f"（过滤: {object_class}）" if object_class else ""
         lines = [
@@ -453,38 +530,25 @@ class GetDetectionsTool(BaseTool):
             f"（坐标系: {coordinate_frame}，可直接用于 Nav2）:",
             f"方向汇总: {summarize_detection_directions(detections)}",
         ]
-        for i, d in enumerate(detections, 1):
+        for d in detections:
             display_name = CLASS_NAMES_ZH.get(
                 d.class_name.lower(), d.class_name
             )
             lines.append(
-                f"  {i}. {display_name}（{d.class_name}）: "
+                f"  - {display_name}（{d.class_name}）: "
                 f"在小车{d.direction}; "
                 f"map坐标 x={d.x:.2f}m, y={d.y:.2f}m; "
                 f"检测高度 z={d.z:.2f}m; 置信度={d.confidence:.2f}; "
                 f"已连续确认 {d.confirmed_hits} 帧"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        _detection_snapshots.confirm(round_id, snapshot, result)
+        return result
 
     @staticmethod
     def _direction_from_robot_frame(x: float, y: float) -> str:
-        """Return a coarse Chinese direction in base_link coordinates."""
-        angle = math.atan2(y, x)
-        if -math.pi / 8 <= angle < math.pi / 8:
-            return "正前方"
-        if math.pi / 8 <= angle < 3 * math.pi / 8:
-            return "左前方"
-        if 3 * math.pi / 8 <= angle < 5 * math.pi / 8:
-            return "左侧"
-        if 5 * math.pi / 8 <= angle < 7 * math.pi / 8:
-            return "左后方"
-        if angle >= 7 * math.pi / 8 or angle < -7 * math.pi / 8:
-            return "正后方"
-        if -7 * math.pi / 8 <= angle < -5 * math.pi / 8:
-            return "右后方"
-        if -5 * math.pi / 8 <= angle < -3 * math.pi / 8:
-            return "右侧"
-        return "右前方"
+        """Return a Chinese direction in base_link coordinates."""
+        return direction_from_robot_frame(x, y)
 
     def _get_direction_transform(self, source_frame: str):
         source_frame = self._normalize_frame_id(source_frame)
@@ -550,12 +614,31 @@ class GetDetectionsTool(BaseTool):
         last_sequence = None
         latest_payload = None
         while time.time() - start < self.timeout_sec:
-            payload = client.get_latest(max_age=self.cache_max_age)
-            if payload is None:
+            get_with_sequence = getattr(client, "get_latest_with_sequence", None)
+            if get_with_sequence is not None:
+                latest = get_with_sequence(max_age=self.cache_max_age)
+                if latest is None:
+                    payload = None
+                    receive_sequence = None
+                    received_at = None
+                else:
+                    payload, receive_sequence, received_at = latest
+            else:
+                payload = client.get_latest(max_age=self.cache_max_age)
+                receive_sequence = None
+                received_at = None
+            if payload is None or not isinstance(payload, dict):
                 time.sleep(0.05)
                 continue
-            sequence = (payload.get("stamp", {}).get("sec"),
-                        payload.get("stamp", {}).get("nanosec"))
+            if receive_sequence is not None:
+                sequence = ("received", receive_sequence)
+            else:
+                stamp = payload.get("stamp", {}) or {}
+                sequence = (
+                    stamp.get("sec"),
+                    stamp.get("nanosec"),
+                    payload.get("frame_sequence"),
+                )
             if sequence == last_sequence:
                 time.sleep(0.05)
                 continue
@@ -564,12 +647,7 @@ class GetDetectionsTool(BaseTool):
             detections = self._parse_socket_payload(payload)
             if payload.get("stabilized") and detections:
                 return payload, detections
-            payload_time = time.time()
-            stamp = payload.get("stamp", {}) or {}
-            if stamp.get("sec") is not None and stamp.get("nanosec") is not None:
-                candidate_time = float(stamp["sec"]) + float(stamp["nanosec"]) / 1e9
-                if candidate_time > 0:
-                    payload_time = candidate_time
+            payload_time = self._payload_timestamp(payload, received_at)
             confirmed = stabilizer.update(detections, payload_time)
             if confirmed:
                 return payload, confirmed
@@ -657,6 +735,8 @@ class GetDetectionsTool(BaseTool):
             result.append(DetectionObject(
                 class_name=det.class_name,
                 x=nx, y=ny, z=nz,
+                size_x=det.size_x,
+                size_y=det.size_y,
                 confidence=det.confidence,
                 direction=det.direction,
                 confirmed_hits=det.confirmed_hits,
@@ -666,7 +746,11 @@ class GetDetectionsTool(BaseTool):
         )
         return result
 
-    def _run(self, object_class: Optional[str] = None) -> str:
+    def _run_detection(
+        self,
+        round_id: int,
+        object_class: Optional[str] = None,
+    ) -> str:
         if self.detection_source == "socket":
             client = _get_socket_client(self.socket_host, self.socket_port)
 
@@ -708,13 +792,15 @@ class GetDetectionsTool(BaseTool):
                 return self._format_transform_error(source_frame, e)
             all_detections = list(detections)
             return self._format_detections(
+                round_id,
                 detections,
                 object_class,
                 coordinate_frame=self._target_frame_name(),
                 snapshot_detections=all_detections,
             )
 
-        # 直接用 test_raw_sub.py 的模式 — spin_once 循环
+        # ROS 直连模式也使用同一套多帧确认逻辑，避免 socket 和 ROS
+        # 两条入口对“已确认目标”的定义不一致。
         import rclpy
         from vision_msgs.msg import Detection3DArray
 
@@ -724,64 +810,118 @@ class GetDetectionsTool(BaseTool):
         def cb(msg): cache.append(msg)
         node.create_subscription(Detection3DArray, self.topic, cb, 10)
 
+        stabilizer = DetectionStabilizer(
+            min_hits=self.confirmation_hits,
+            window_size=self.confirmation_window,
+            window_seconds=min(self.confirmation_window_seconds, self.timeout_sec),
+            match_distance=self.confirmation_distance,
+            max_missed_frames=self.confirmation_max_missed_frames,
+        )
         start = time.time()
         payload = None
-        empty_count = 0
+        detections = []
+        source_frame = None
         while time.time() - start < self.timeout_sec:
             rclpy.spin_once(node, timeout_sec=0.2)
-            if cache:
+            while cache:
                 msg = cache.pop(0)
-                if msg.detections:
-                    payload = msg
+                current_frame = self._normalize_frame_id(
+                    getattr(getattr(msg, "header", None), "frame_id", "")
+                )
+                if source_frame is not None and current_frame != source_frame:
+                    # 不把不同坐标系的点混进同一条轨迹。
+                    stabilizer = DetectionStabilizer(
+                        min_hits=self.confirmation_hits,
+                        window_size=self.confirmation_window,
+                        window_seconds=min(
+                            self.confirmation_window_seconds,
+                            self.timeout_sec,
+                        ),
+                        match_distance=self.confirmation_distance,
+                        max_missed_frames=self.confirmation_max_missed_frames,
+                    )
+                source_frame = current_frame
+                payload = msg
+                raw_detections = self._parse_detection3d_array(msg)
+                detections = stabilizer.update(
+                    raw_detections,
+                    self._message_timestamp(msg),
+                )
+                if detections:
                     break
-                else:
-                    empty_count += 1
+            if detections:
+                break
 
         node.destroy_node()
 
         if payload is None:
             return (
                 f"未收到检测结果（等待 {self.timeout_sec}s，"
-                f"收到 {empty_count} 个空帧）。"
+                "没有收到有效检测帧）。"
                 f"请确认 Orin 的 VoteNet 正在发布 {self.topic}。"
             )
 
-        detections = self._parse_detection3d_array(payload)
+        if not detections:
+            return (
+                f"暂未确认稳定目标。已等待 {self.timeout_sec:.1f}s，至少需要"
+                f" {self.confirmation_hits} 帧类别和位置一致的检测。"
+            )
 
-        # TF 变换: rslidar → map
-        source_frame = self._normalize_frame_id(payload.header.frame_id)
+        # 先计算相对方向，再把已确认目标变换到 map。
+        direction_transform = self._get_direction_transform(source_frame)
+        detections = self._apply_direction_transform(
+            detections, direction_transform
+        )
         try:
             detections = self._transform_detections(detections, source_frame)
         except DetectionTransformError as e:
             return self._format_transform_error(source_frame, e)
 
-        # 按类别过滤
-        if object_class:
-            detections = [
-                d for d in detections
-                if d.class_name.lower() == object_class.lower()
-            ]
-
-        if not detections:
-            msg = "当前未检测到任何目标物体。"
-            if object_class:
-                msg = f"当前未检测到类别为 '{object_class}' 的目标。"
-            return msg
-
         return self._format_detections(
+            round_id,
             detections,
             object_class,
             coordinate_frame=self._target_frame_name(),
+            snapshot_detections=list(detections),
         )
+
+    def _run(self, object_class: Optional[str] = None) -> str:
+        round_id = _detection_snapshots.begin()
+        try:
+            result = self._run_detection(round_id, object_class)
+        except Exception as exc:
+            _detection_snapshots.fail(round_id, f"检测执行异常：{exc}")
+            raise
+
+        state = _detection_snapshots.read()
+        if state["round_id"] == round_id and state["status"] == "pending":
+            _detection_snapshots.fail(round_id, result)
+        return result
 
 
 class NavigateToDetectedTargetInput(BaseModel):
     target: str = Field(
+        default="",
         description=(
-            "刚才检测结果中的目标选择。可填序号，如'1'；方向，如'左侧'、"
-            "'左前方'；或类别，如'椅子'。"
+            "刚才检测结果中的目标描述。优先使用方向加类别，如"
+            "'前方偏左的椅子'、'右侧的柜子'；也可只填类别。"
         )
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_target(cls, values):
+        """Keep older model calls useful without adding tool parameters."""
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        if not str(values.get("target") or "").strip():
+            for key in ("name", "object", "object_class", "class_name"):
+                candidate = values.get(key)
+                if candidate is not None and str(candidate).strip():
+                    values["target"] = candidate
+                    break
+        return values
 
 
 class NavigateToDetectedTargetTool(BaseTool):
@@ -790,36 +930,150 @@ class NavigateToDetectedTargetTool(BaseTool):
     name: str = "navigate_to_detected_target"
     description: str = (
         "目标导航必须首先调用本工具。它只使用最近一次 get_detections "
-        "保存的已确认快照，不会重新检测。用户说'去左侧的椅子'、"
-        "'找桌子'、'去第一个目标'时直接使用；仅当本工具明确返回没有"
-        "可用快照时，才允许调用 get_detections。"
+        "保存的已确认快照，不会为已有快照重新检测。用户说'去左侧的椅子'、"
+        "'去前方偏右的椅子'、'找桌子'时直接使用；从未执行过检测时，"
+        "工具会自动调用一次 get_detections。最近一轮失败或无匹配目标时不得"
+        "回退旧轮次。工具会导航到物体前的安全接近点，不会把障碍物中心直接"
+        "作为 Nav2 终点。"
     )
     args_schema: Type[NavigateToDetectedTargetInput] = NavigateToDetectedTargetInput
     navigate_tool: object = Field(..., exclude=True)
+    detection_tool: object | None = Field(default=None, exclude=True)
+    costmap_service: str = Field(
+        default="/global_costmap/get_costmap",
+        exclude=True,
+    )
+    costmap_timeout_sec: float = Field(default=2.0, exclude=True)
 
-    def _run(self, target: str) -> str:
-        detections = get_detection_snapshot()
-        if not detections:
-            return "没有可用的已确认检测快照，请先调用 get_detections。"
+    def _load_global_costmap(self) -> dict:
+        response = self.navigate_tool.connector.service_call(
+            ROS2Message(payload={}),
+            target=self.costmap_service,
+            msg_type="nav2_msgs/srv/GetCostmap",
+            timeout_sec=self.costmap_timeout_sec,
+        )
+        payload = response.payload
+        costmap_message = (
+            payload.get("map")
+            if isinstance(payload, dict)
+            else getattr(payload, "map", None)
+        )
+        if costmap_message is None:
+            raise ValueError("global costmap 响应缺少 map 字段")
+        return normalize_costmap(costmap_message)
+
+    def _run(self, target: str = "") -> str:
+        target = str(target or "").strip()
+        if not target:
+            return "请说明要导航的目标类别或方向，例如“去前方偏左的椅子”。"
+
+        latest_round = get_latest_detection_round()
+        if latest_round["status"] == "never":
+            if self.detection_tool is not None:
+                try:
+                    # 由工具本身兜底，保证命令行 Agent 也遵守“无快照先检测一次”。
+                    self.detection_tool.invoke({"object_class": None})
+                except Exception as exc:
+                    logger.warning("自动获取检测结果失败: %s", exc)
+                latest_round = get_latest_detection_round()
+            if latest_round["status"] == "never":
+                return "没有任何检测轮次，自动检测未返回结果，请先查看检测结果。"
+        if latest_round["status"] != "confirmed":
+            detail = latest_round["message"] or "本轮未形成已确认目标"
+            return f"最近一轮检测没有可用的结构化快照：{detail}"
+        detections = latest_round["detections"]
 
         selected = select_detection_targets(detections, target)
         if len(selected) != 1:
             if not selected:
-                return f"最近的检测快照中没有匹配“{target}”的目标。"
-            return f"检测快照中有多个目标匹配“{target}”，请指定序号。"
+                return f"最近一轮检测中没有匹配“{target}”的目标。"
+            choices = []
+            for item in selected:
+                display_name = CLASS_NAMES_ZH.get(
+                    item.class_name.lower(), item.class_name
+                )
+                choice = f"{item.direction}的{display_name}"
+                if choice not in choices:
+                    choices.append(choice)
+            choices_text = "、".join(choices)
+            if len(choices) == 1:
+                return (
+                    f"检测快照中有多个“{choices_text}”，当前方向仍无法安全区分。"
+                    "请让小车稍微改变朝向后重新检测，不需要选择序号。"
+                )
+            return (
+                f"检测快照中有多个目标匹配“{target}”：{choices_text}。"
+                f"请直接按方向说明，例如“去{choices[0]}”，不需要选择序号。"
+            )
 
         detection = selected[0]
-        result = self.navigate_tool.invoke({
-            "x": detection.x,
-            "y": detection.y,
-        })
+        try:
+            localization = self.navigate_tool.localization_manager.require_localized()
+            confirmed_pose = localization.get("pose")
+            if not confirmed_pose:
+                raise LocalizationError("没有已确认的 AMCL 位姿")
+            standoff_distance = calculate_detection_standoff(
+                detection.size_x,
+                detection.size_y,
+            )
+            candidates, target_distance = generate_standoff_candidates(
+                confirmed_pose,
+                detection.x,
+                detection.y,
+                standoff_distance,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, LocalizationError) as exc:
+            return f"无法计算目标安全接近点：{exc}。"
+
         class_name = CLASS_NAMES_ZH.get(
             detection.class_name.lower(), detection.class_name
         )
+        if target_distance <= standoff_distance:
+            return (
+                f"刚才确认的{class_name}位于小车{detection.direction}，"
+                f"目标中心 map 坐标 x={detection.x:.2f}m, y={detection.y:.2f}m；"
+                f"当前距离约 {target_distance:.2f}m，已在 "
+                f"{standoff_distance:.2f}m 安全接近范围内，未启动导航。"
+            )
+
+        approach_x, approach_y = candidates[0]
+        approach_note = "按目标近侧计算"
+        try:
+            costmap = self._load_global_costmap()
+        except Exception as exc:
+            logger.warning("读取 global costmap 失败，使用近侧接近点: %s", exc)
+            approach_note = "global costmap 不可用，已使用目标近侧回退点"
+        else:
+            selected_candidate = select_costmap_candidate(
+                candidates,
+                costmap,
+                start=(float(confirmed_pose["x"]), float(confirmed_pose["y"])),
+            )
+            if selected_candidate is None:
+                return (
+                    f"最近一轮确认的{class_name}位于小车{detection.direction}，"
+                    f"但目标中心周围 {standoff_distance:.2f}m 的候选接近点"
+                    "均处于障碍、未知区域或地图范围外，未启动导航。"
+                )
+            approach_x, approach_y, approach_cost = selected_candidate
+            approach_note = (
+                "已通过 global costmap 障碍及路径连通性筛选"
+                f"（代价值 {approach_cost}）"
+            )
+
+        result = self.navigate_tool.invoke({
+            "x": approach_x,
+            "y": approach_y,
+        })
+        result_text = str(result)
+        launch_label = "已使用" if "导航已开始" in result_text else "未能启动"
         return (
-            f"已使用刚才确认的{class_name}（小车{detection.direction}）坐标导航，"
-            f"目标 map 坐标 x={detection.x:.2f}m, y={detection.y:.2f}m。\n"
-            f"{result}"
+            f"{launch_label}刚才确认的{class_name}（小车{detection.direction}）"
+            f"规划接近导航。"
+            f"物体中心 map 坐标 x={detection.x:.2f}m, y={detection.y:.2f}m；"
+            f"安全接近点 x={approach_x:.2f}m, y={approach_y:.2f}m，"
+            f"与物体中心保留 {standoff_distance:.2f}m，{approach_note}。\n"
+            f"{result_text}"
         )
 
 

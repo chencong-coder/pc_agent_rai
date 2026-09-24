@@ -28,7 +28,8 @@ from examples.pc_agent.localization import (
 )
 from examples.pc_agent.detection_selection import is_detection_navigation_request
 from examples.pc_agent.tools import (
-    get_detection_snapshot,
+    clear_detection_history,
+    get_latest_detection_round,
     get_navigation_status,
 )
 
@@ -283,6 +284,7 @@ def queue_cancel() -> None:
 
 
 def clear_session() -> None:
+    clear_detection_history()
     st.session_state.messages = [AIMessage(content="会话已清空。")]
     st.session_state.tool_events = []
     st.session_state.execution_records = []
@@ -311,6 +313,7 @@ def initialize_agent() -> None:
     st.session_state.pop("agent_error", None)
     st.session_state.tools = tools
     st.session_state.connector = connector
+    clear_detection_history()
     st.session_state.messages = [
         AIMessage(content="已连接。请先自动定位，再输入地图坐标或目标类别。")
     ]
@@ -319,7 +322,9 @@ def initialize_agent() -> None:
 
 
 def message_content(message) -> str:
-    content = message.content
+    if isinstance(message, str):
+        return message
+    content = getattr(message, "content", message)
     if isinstance(content, str):
         return content
     # Text blocks are common with newer LangChain model adapters.
@@ -367,6 +372,72 @@ def collect_execution(record: dict, messages: list) -> None:
         record["reply"] = message_content(messages[-1])
 
 
+def _invoke_direct_tool(tool_name: str, args: dict, call_prefix: str) -> list:
+    """Invoke one tool while preserving a normal LangChain tool-call record."""
+    tool = next(
+        item for item in st.session_state.tools if item.name == tool_name
+    )
+    call_id = f"{call_prefix}-{uuid4().hex}"
+    raw_output = tool.invoke({
+        "type": "tool_call",
+        "name": tool_name,
+        "args": args,
+        "id": call_id,
+    })
+    tool_output = (
+        raw_output
+        if isinstance(raw_output, ToolMessage)
+        else ToolMessage(
+            content=str(raw_output),
+            tool_call_id=call_id,
+            name=tool_name,
+        )
+    )
+    return [
+        AIMessage(content="", tool_calls=[{
+            "id": call_id,
+            "name": tool_name,
+            "args": args,
+        }]),
+        tool_output,
+    ]
+
+
+def _invoke_detection_navigation(prompt: str) -> dict:
+    """Navigate from only the latest detection round, detecting once if absent."""
+    messages = []
+    reply_parts = []
+    latest_round = get_latest_detection_round()
+
+    if latest_round["status"] == "never":
+        detection_messages = _invoke_direct_tool(
+            "get_detections",
+            {"object_class": None},
+            "automatic-detection",
+        )
+        messages.extend(detection_messages)
+        reply_parts.append(message_content(detection_messages[-1]))
+        latest_round = get_latest_detection_round()
+
+    if latest_round["status"] == "confirmed":
+        navigation_messages = _invoke_direct_tool(
+            "navigate_to_detected_target",
+            {"target": prompt},
+            "snapshot-navigation",
+        )
+        messages.extend(navigation_messages)
+        reply_parts.append(message_content(navigation_messages[-1]))
+    else:
+        detail = latest_round["message"] or "本轮没有已确认目标"
+        reply_parts.append(
+            f"最近一轮检测没有可用目标：{detail}。"
+            "请重新执行“查看检测结果”后再导航。"
+        )
+
+    messages.append(AIMessage(content="\n\n".join(reply_parts)))
+    return {"messages": messages}
+
+
 def invoke_agent(prompt: str) -> None:
     """Store one request, its tool results and the displayed reply together."""
     record = {
@@ -388,50 +459,15 @@ def invoke_agent(prompt: str) -> None:
             "停下", "停止", "取消导航", "取消当前导航"
         }
         if direct_cancel:
-            cancel_tool = next(
-                tool for tool in st.session_state.tools
-                if tool.name == "cancel_navigation"
+            cancel_messages = _invoke_direct_tool(
+                "cancel_navigation", {}, "cancel"
             )
-            call_id = f"cancel-{uuid4().hex}"
-            tool_output = cancel_tool.invoke({
-                "type": "tool_call",
-                "name": "cancel_navigation",
-                "args": {},
-                "id": call_id,
-            })
             result = {"messages": [
-                AIMessage(content="", tool_calls=[{
-                    "id": call_id,
-                    "name": "cancel_navigation",
-                    "args": {},
-                }]),
-                tool_output,
-                AIMessage(content=str(tool_output.content)),
+                *cancel_messages,
+                AIMessage(content=message_content(cancel_messages[-1])),
             ]}
-        elif (
-            get_detection_snapshot()
-            and is_detection_navigation_request(prompt)
-        ):
-            snapshot_tool = next(
-                tool for tool in st.session_state.tools
-                if tool.name == "navigate_to_detected_target"
-            )
-            call_id = f"snapshot-navigation-{uuid4().hex}"
-            tool_output = snapshot_tool.invoke({
-                "type": "tool_call",
-                "name": "navigate_to_detected_target",
-                "args": {"target": prompt},
-                "id": call_id,
-            })
-            result = {"messages": [
-                AIMessage(content="", tool_calls=[{
-                    "id": call_id,
-                    "name": "navigate_to_detected_target",
-                    "args": {"target": prompt},
-                }]),
-                tool_output,
-                AIMessage(content=str(tool_output.content)),
-            ]}
+        elif is_detection_navigation_request(prompt):
+            result = _invoke_detection_navigation(prompt)
         else:
             conversation = list(st.session_state.messages[-12:])
             result = st.session_state.agent.invoke(

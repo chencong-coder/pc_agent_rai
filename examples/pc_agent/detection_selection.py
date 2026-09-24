@@ -1,5 +1,6 @@
 """Deterministic selection of targets from the latest detection snapshot."""
 
+import math
 import re
 
 
@@ -33,6 +34,7 @@ CLASS_COUNTERS_ZH = {
 
 DIRECTION_ORDER = (
     "正前方",
+    "前方偏左",
     "左前方",
     "左侧",
     "左后方",
@@ -40,10 +42,25 @@ DIRECTION_ORDER = (
     "右后方",
     "右侧",
     "右前方",
+    "前方偏右",
     "方向未知",
 )
 
 DIRECTION_ALIASES = {
+    "正前方偏左": "前方偏左",
+    "正前方偏右": "前方偏右",
+    "前方偏左": "前方偏左",
+    "前方偏右": "前方偏右",
+    "偏左前方": "前方偏左",
+    "偏右前方": "前方偏右",
+    "左前面": "前方偏左",
+    "右前面": "前方偏右",
+    "前方左侧": "前方偏左",
+    "前方右侧": "前方偏右",
+    "左前": "前方偏左",
+    "右前": "前方偏右",
+    "偏左": "前方偏左",
+    "偏右": "前方偏右",
     "正前方": "正前方",
     "左前方": "左前方",
     "右前方": "右前方",
@@ -65,9 +82,64 @@ DIRECTION_ALIASES = {
 _NUMBER_WORDS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
 
 
+def select_one_to_one_matches(candidates: list[tuple]) -> list[tuple]:
+    """Greedily choose nearest matches with one track and detection per frame."""
+    selected = []
+    matched_tracks = set()
+    matched_detections = set()
+    for candidate in sorted(candidates):
+        _, track_index, detection_index = candidate
+        if (
+            track_index in matched_tracks
+            or detection_index in matched_detections
+        ):
+            continue
+        matched_tracks.add(track_index)
+        matched_detections.add(detection_index)
+        selected.append(candidate)
+    return selected
+
+
+def direction_from_robot_frame(x: float, y: float) -> str:
+    """Describe a target direction using base_link's x-forward convention."""
+    try:
+        x = float(x)
+        y = float(y)
+    except (TypeError, ValueError):
+        return "方向未知"
+    if not math.isfinite(x) or not math.isfinite(y):
+        return "方向未知"
+    angle = math.atan2(y, x)
+    center_tolerance = math.radians(5.0)
+    if -center_tolerance <= angle <= center_tolerance:
+        return "正前方"
+    if center_tolerance < angle < math.pi / 8:
+        return "前方偏左"
+    if math.pi / 8 <= angle < 3 * math.pi / 8:
+        return "左前方"
+    if 3 * math.pi / 8 <= angle < 5 * math.pi / 8:
+        return "左侧"
+    if 5 * math.pi / 8 <= angle < 7 * math.pi / 8:
+        return "左后方"
+    if angle >= 7 * math.pi / 8 or angle < -7 * math.pi / 8:
+        return "正后方"
+    if -7 * math.pi / 8 <= angle < -5 * math.pi / 8:
+        return "右后方"
+    if -5 * math.pi / 8 <= angle < -3 * math.pi / 8:
+        return "右侧"
+    if -math.pi / 8 < angle < -center_tolerance:
+        return "前方偏右"
+    return "右前方"
+
+
 def is_detection_navigation_request(prompt: str) -> bool:
     """Return whether a command should navigate using the saved snapshot."""
     query = str(prompt or "").strip().lower()
+    if re.search(
+        r"(?:\bx\b|x坐标|横坐标)\s*[=:：].*(?:\by\b|y坐标|纵坐标)\s*[=:：]",
+        query,
+    ):
+        return False
     navigation_words = ("去", "找", "导航到", "前往", "过去", "带我到", "靠近")
     if not any(word in query for word in navigation_words):
         return False
@@ -78,10 +150,14 @@ def is_detection_navigation_request(prompt: str) -> bool:
     has_numbered_target = bool(
         re.search(r"第\s*(?:\d+|一|二|三|四|五)\s*(?:个|号)?", query)
     )
+    has_generic_target = any(
+        word in query for word in ("目标", "物体", "东西", "那里", "刚才")
+    )
     return (
         any(word in query for word in class_words)
         or any(word in query for word in DIRECTION_ALIASES)
         or has_numbered_target
+        or has_generic_target
     )
 
 
@@ -146,7 +222,11 @@ def select_detection_targets(detections: list, target: str) -> list:
     direction_filter = next(
         (
             canonical
-            for alias, canonical in DIRECTION_ALIASES.items()
+            for alias, canonical in sorted(
+                DIRECTION_ALIASES.items(),
+                key=lambda item: len(item[0]),
+                reverse=True,
+            )
             if alias in query
         ),
         None,
@@ -160,12 +240,17 @@ def select_detection_targets(detections: list, target: str) -> list:
             if detection.class_name.lower() == class_filter
         ]
     if direction_filter is not None:
+        matching_directions = {direction_filter}
+        if direction_filter == "正前方":
+            matching_directions.update(("前方偏左", "前方偏右"))
         selected = [
             detection
             for detection in selected
-            if detection.direction == direction_filter
+            if detection.direction in matching_directions
         ]
     if class_filter is None and direction_filter is None:
+        if any(word in query for word in ("目标", "物体", "东西", "那里", "刚才")):
+            return list(detections)
         selected = [
             detection
             for detection in detections

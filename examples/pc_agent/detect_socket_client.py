@@ -16,6 +16,7 @@ class DetectBBox3DSocketClient:
         self.port = port
         self.latest_msg: dict[str, Any] | None = None
         self.latest_time = 0.0
+        self._receive_sequence = 0
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -31,12 +32,19 @@ class DetectBBox3DSocketClient:
         self._running = False
 
     def get_latest(self, max_age: float = 2.0) -> dict[str, Any] | None:
+        latest = self.get_latest_with_sequence(max_age=max_age)
+        return latest[0] if latest is not None else None
+
+    def get_latest_with_sequence(
+        self, max_age: float = 2.0
+    ) -> tuple[dict[str, Any], int, float] | None:
+        """Return the newest payload, receive sequence, and local receive time."""
         with self._lock:
             if self.latest_msg is None:
                 return None
             if time.time() - self.latest_time > max_age:
                 return None
-            return self.latest_msg
+            return self.latest_msg, self._receive_sequence, self.latest_time
 
     def _loop(self):
         while self._running:
@@ -56,6 +64,7 @@ class DetectBBox3DSocketClient:
                         with self._lock:
                             self.latest_msg = msg
                             self.latest_time = time.time()
+                            self._receive_sequence += 1
             except Exception as exc:
                 if self._running:
                     logger.warning(
