@@ -149,6 +149,54 @@ class LocalizationQualityTests(unittest.TestCase):
         self.assertTrue(manager.is_localized())
         self.assertEqual(manager.require_localized()["pose"], status["pose"])
 
+    def test_stationary_seed_refreshes_status_without_changing_pose_timestamp(self):
+        manager, connector, clock = self.make_manager()
+        clock.now = 10.0
+        initial = self.localize(manager, connector, clock)
+        for now in (11.0, 12.0, 100.0):
+            with self.subTest(now=now):
+                clock.now = now
+                status = manager.get_status()
+                self.assertEqual(status["refreshed_at"], now)
+                self.assertGreater(status["refreshed_at"], initial["refreshed_at"])
+                self.assertEqual(status["pose"], initial["pose"])
+                self.assertEqual(status["pose"]["updated_at"], 10.0)
+                self.assertEqual(status["status"], "localized")
+                self.assertEqual(status["label"], "已定位")
+                self.assertTrue(manager.is_localized())
+                self.assertEqual(manager.require_localized()["pose"], initial["pose"])
+
+    def test_status_refresh_does_not_pretend_amcl_message_was_received(self):
+        manager, connector, clock = self.make_manager()
+        self.localize(manager, connector, clock)
+        clock.now = 10.0
+        connector.callback(_pose_message(_covariance(), x=8.0))
+        received = manager.get_status()
+        clock.now = 20.0
+        refreshed = manager.require_localized()
+        self.assertEqual(refreshed["refreshed_at"], 20.0)
+        self.assertEqual(refreshed["pose"], received["pose"])
+        self.assertEqual(refreshed["pose"]["updated_at"], 10.0)
+        self.assertEqual(refreshed["pose"]["source"], "/amcl_pose")
+        self.assertEqual(refreshed["last_pose_age"], 10.0)
+        self.assertFalse(refreshed["fresh"])
+        self.assertEqual(refreshed["status"], "localized")
+
+    def test_identical_amcl_coordinates_still_advance_received_timestamp(self):
+        manager, connector, clock = self.make_manager()
+        self.localize(manager, connector, clock)
+        for now in (1.0, 2.0, 3.0):
+            with self.subTest(now=now):
+                clock.now = now
+                connector.callback(_pose_message(_covariance(), x=8.0, y=9.0, yaw=0.0))
+                status = manager.require_localized()
+                self.assertEqual(status["pose"]["x"], 8.0)
+                self.assertEqual(status["pose"]["y"], 9.0)
+                self.assertEqual(status["pose"]["yaw"], 0.0)
+                self.assertEqual(status["pose"]["updated_at"], now)
+                self.assertEqual(status["refreshed_at"], now)
+                self.assertTrue(status["fresh"])
+
     def test_latest_seed_is_used_instead_of_pre_click_amcl(self):
         manager, connector, _ = self.make_manager()
         connector.initial_pose_callback(_pose_message(_covariance(), x=1.0))

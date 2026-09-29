@@ -48,6 +48,8 @@ SYSTEM_PROMPT = """你是一个无人车控制助手。根据用户指令使用�
 - 用户直接提供地图坐标时（例如“去 map 坐标 x=-4.2, y=2.97”或“去 (-4.2, 2.97)”），直接调用 navigate_to_coordinates；不要调用 get_detections，也不要把用户给出的坐标当成编造坐标
 - navigate_to_coordinates 只接收目标 map 坐标 x、y；若定位使用了 RViz 2D Pose Estimate，工具沿用用户画箭头选择的 yaw 作为导航目标朝向；没有 2D Pose 时才根据当前位置到目标计算朝向；不要传起点、yaw 或 z
 - 两个导航入口都检查是否已获取初始坐标；未定位时提示用户先在 RViz 发布 2D Pose Estimate，再点击页面上的“获取初始坐标”，立即使用收到的 2D Pose 作为当前位置，无需等待 AMCL 收敛；之后每条有效 /amcl_pose 更新实时位置。不会触发全局定位、旋转搜索或重复发布 initialpose
+- 定位状态与 TF 坐标转换状态分别处理：工具明确“已定位”时，不得因检测或导航的 TF 失败改称“未定位”，不得要求重新发布 2D Pose 或等待 AMCL 收敛；应准确说明缺失的坐标转换
+- 检测有相对感知结果但缺少 map 变换时，仍按工具返回的类别、数量、方向描述周围物体；不得编造 map 坐标、宣称可以目标导航或复用上一轮检测快照
 - navigate_to_coordinates 是二维导航；不要把物体检测的高度 z 当成小车导航高度
 - "找XX"/"去XX那里": 只使用最近一轮 get_detections 对应的结构化快照，绝不从普通聊天文字解析坐标，也不搜索更早检测轮次。若从未调用过 get_detections，先调用一次再导航；若最近一轮检测失败或没有匹配目标，直接提示未找到，不得回退到旧轮次；不要用 navigate_to_coordinates 替代
 - 调用 navigate_to_detected_target 时必须传入 target 字段，例如 {"target": "前方偏右的椅子"}；不要传空参数或自行编造坐标
@@ -78,11 +80,20 @@ def create_pc_agent(
 ):
     from rai.communication.ros2.connectors import ROS2Connector
 
-    connector = ROS2Connector(node_name="rai_pc_agent")
+    executor_type = os.getenv("PC_AGENT_ROS_EXECUTOR", "multi_threaded").strip()
+    if executor_type not in {"single_threaded", "multi_threaded"}:
+        raise ValueError(
+            "PC_AGENT_ROS_EXECUTOR 必须为 single_threaded 或 multi_threaded"
+        )
+    connector = ROS2Connector(
+        node_name="rai_pc_agent", executor_type=executor_type
+    )
+    logger.info("ROS executor: %s", executor_type)
     localization_manager = LocalizationManager(connector)
 
     get_detections_tool = GetDetectionsTool(
         connector=connector,
+        localization_manager=localization_manager,
         topic=detection_topic,
         detection_source=detection_source,
         socket_host=socket_host,

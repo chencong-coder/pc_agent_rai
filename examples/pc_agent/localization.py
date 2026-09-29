@@ -120,6 +120,7 @@ def get_localization_status() -> dict:
             "last_pose_age": None,
             "pose": None,
             "updated_at": 0.0,
+            "refreshed_at": time.time(),
         }
     return manager.get_status()
 
@@ -266,7 +267,7 @@ class LocalizationManager:
         )
         self._set_status_locked(
             "localized",
-            "已获取 2D Pose Estimate 初始坐标，等待 AMCL 更新实时位置",
+            "已定位，已采用人工发布的 2D Pose 初始坐标",
         )
 
     def _is_localized_locked(self, _now: float) -> bool:
@@ -366,7 +367,7 @@ class LocalizationManager:
                     self._confirm_pose_locked(x, y, yaw)
                     self._set_status_locked(
                         "localized",
-                        "已获取初始坐标，正在通过 AMCL 更新实时位置",
+                        "已定位，正在通过 AMCL 更新实时位置",
                     )
                 return
 
@@ -461,6 +462,7 @@ class LocalizationManager:
                 if self._is_localized_locked(now)
                 else None,
                 "updated_at": self._updated_at,
+                "refreshed_at": self._wall_clock(),
             }
 
     def _publish_rotation(self, angular_z: float) -> None:

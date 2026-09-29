@@ -196,17 +196,23 @@ def render_robot_status() -> None:
             float(pose["updated_at"]),
             _display_timezone(),
         ).strftime("%H:%M:%S")
+        refreshed_at = datetime.fromtimestamp(
+            float(localization_status.get("refreshed_at") or time.time()),
+            _display_timezone(),
+        ).strftime("%H:%M:%S")
         columns = st.columns(4, gap="small")
         columns[0].metric("X（map，米）", f"{pose['x']:.3f}")
         columns[1].metric("Y（map，米）", f"{pose['y']:.3f}")
         columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}")
-        columns[3].metric("本地更新时间", updated_at)
+        columns[3].metric("本地刷新时间", refreshed_at)
         if pose.get("source") == "/initialpose":
-            st.caption("位置来源：2D Pose Estimate，等待 AMCL 更新")
+            source_detail = "已定位 · 位置来源：人工 2D Pose Estimate 初始位姿"
+            source_detail += "；暂未收到 AMCL 新位姿，保持已确认坐标"
         elif localization_status.get("fresh"):
-            st.caption("位置来源：AMCL")
+            source_detail = "已定位 · 位置来源：AMCL"
         else:
-            st.caption("位置来源：AMCL，暂未收到新消息，保留最后位置")
+            source_detail = "已定位 · 位置来源：AMCL，暂未收到新位姿，保留最后位置"
+        st.caption(f"{source_detail} · 位姿更新时间：{updated_at}")
     elif localization_state == "failed":
         detail = localization_status.get("message") or "初始坐标获取失败"
         st.error(f"暂无有效位置：{detail}")
@@ -220,7 +226,7 @@ def render_robot_status() -> None:
     status_columns[1].metric("坐标系", "map")
     status_columns[2].metric(
         "定位状态",
-        localization_status.get("label", "等待定位"),
+        "已定位" if localization_state == "localized" else localization_status.get("label", "等待定位"),
     )
     status_columns[3].metric("导航状态", _navigation_label(navigation_status))
 
@@ -275,10 +281,13 @@ def render_localization_controls() -> None:
                 st.info("当前没有正在进行的初始坐标获取")
 
     localization = get_localization_status()
-    st.caption(
-        f"定位：{localization.get('label', '等待定位')} · "
-        f"{localization.get('message', '')}"
-    )
+    if localization.get("status") == "localized":
+        st.caption("定位：已定位 · 初始坐标已确认，持续刷新位置，无需重复发布 2D Pose")
+    else:
+        st.caption(
+            f"定位：{localization.get('label', '等待定位')} · "
+            f"{localization.get('message', '')}"
+        )
 
 
 # ── 状态与 Agent ───────────────────────────────────────────────────────────

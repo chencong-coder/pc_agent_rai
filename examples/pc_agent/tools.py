@@ -350,11 +350,12 @@ class GetDetectionsTool(BaseTool):
     description: str = (
         "获取小车 VoteNet 检测到的周围物体及其 3D 坐标。"
         "可选参数 object_class 按类别过滤（如 'chair'）。"
-        "仅在检测坐标成功转换到 map 后返回物体类别、地图坐标(x,y,z)、置信度。"
+        "返回物体类别、方向和置信度；仅在变换成功时提供可导航的地图坐标。"
     )
     args_schema: Type[GetDetectionsToolInput] = GetDetectionsToolInput
 
     connector: ROS2Connector = Field(..., exclude=True)
+    localization_manager: object | None = Field(default=None, exclude=True)
     topic: str = Field(default="/detect_bbox3d")
     detection_source: str = Field(default="socket", description="socket 或 ros")
     socket_host: str = Field(default="127.0.0.1")
@@ -662,19 +663,47 @@ class GetDetectionsTool(BaseTool):
         return self._normalize_frame_id(self.target_frame) or "map"
 
     def _format_transform_error(
-        self, source_frame: str, error: Exception
+        self, source_frame: str, error: Exception,
+        detections: Optional[list[DetectionObject]] = None,
+        object_class: Optional[str] = None,
     ) -> str:
         source = self._normalize_frame_id(source_frame) or "未知"
         target = self._target_frame_name()
-        logger.error(
-            f"检测坐标无法从 {source} 转换到 {target}: {error}"
-        )
-        return (
-            f"检测结果当前属于 {source} 坐标系，未能转换为 {target} 坐标系。"
-            "本次不返回坐标，避免把激光雷达坐标误当成 Nav2 目标。"
-            f"请确认 AMCL 已完成初始定位，并检查: "
-            f"ros2 run tf2_ros tf2_echo {target} {source}"
-        )
+        logger.error("检测坐标无法从 %s 转换到 %s: %s", source, target, error)
+        state = {}
+        if self.localization_manager is not None:
+            state = self.localization_manager.get_status()
+        if state.get("status") == "localized" and state.get("pose") is not None:
+            status_message = "已定位，初始坐标已获取，无需重新发布 2D Pose。"
+        else:
+            status_message = "尚未获取初始坐标；请发布一次 2D Pose，再点击“获取初始坐标”。"
+        visible = [
+            detection for detection in (detections or [])
+            if not object_class or detection.class_name.lower() == object_class.lower()
+        ]
+        lines = []
+        if visible:
+            lines.extend([
+                f"检测到 {len(visible)} 个目标（仅相对感知结果，暂无可导航地图坐标）:",
+                f"方向汇总: {summarize_detection_directions(visible)}",
+            ])
+            for detection in visible:
+                name = CLASS_NAMES_ZH.get(detection.class_name.lower(), detection.class_name)
+                lines.append(
+                    f"  - {name}（{detection.class_name}）: {detection.direction}; "
+                    f"置信度={detection.confidence:.2f}; "
+                    f"已连续确认 {detection.confirmed_hits} 帧"
+                )
+        elif object_class:
+            lines.append(f"本轮未检测到类别为 '{object_class}' 的目标。")
+        lines.extend([
+            status_message,
+            f"检测坐标变换 {source} → {target} 不可用；暂无可导航的 {target} 坐标，"
+            "本轮结果不会用于导航，也不会使用旧轮次坐标。",
+            f"TF 原因：{error}",
+            f"请检查：ros2 run tf2_ros tf2_echo {target} {source}",
+        ])
+        return "\n".join(lines)
 
     @staticmethod
     def _apply_transform(
@@ -719,7 +748,7 @@ class GetDetectionsTool(BaseTool):
                 f"TF 变换 {source_frame}→{target_frame} 失败: {e}"
             )
             raise DetectionTransformError(
-                f"TF 变换 {source_frame}→{target_frame} 失败"
+                f"TF 变换 {source_frame}→{target_frame} 失败: {e}"
             ) from e
 
         q = tf.transform.rotation
@@ -789,7 +818,7 @@ class GetDetectionsTool(BaseTool):
             try:
                 detections = self._transform_detections(detections, source_frame)
             except DetectionTransformError as e:
-                return self._format_transform_error(source_frame, e)
+                return self._format_transform_error(source_frame, e, detections, object_class)
             all_detections = list(detections)
             return self._format_detections(
                 round_id,
@@ -875,7 +904,7 @@ class GetDetectionsTool(BaseTool):
         try:
             detections = self._transform_detections(detections, source_frame)
         except DetectionTransformError as e:
-            return self._format_transform_error(source_frame, e)
+            return self._format_transform_error(source_frame, e, detections, object_class)
 
         return self._format_detections(
             round_id,
@@ -1011,7 +1040,7 @@ class NavigateToDetectedTargetTool(BaseTool):
             localization = self.navigate_tool.localization_manager.require_localized()
             confirmed_pose = localization.get("pose")
             if not confirmed_pose:
-                raise LocalizationError("没有已确认的 AMCL 位姿")
+                raise LocalizationError("没有已确认的当前位姿")
             standoff_distance = calculate_detection_standoff(
                 detection.size_x,
                 detection.size_y,
@@ -1134,11 +1163,28 @@ class NavigateToCoordinatesTool(BaseTool):
             localization = self.localization_manager.require_localized()
             confirmed_pose = localization.get("pose")
             if not confirmed_pose:
-                raise LocalizationError("没有已确认的 AMCL 位姿")
+                raise LocalizationError("没有已确认的当前位姿")
             robot_x = float(confirmed_pose["x"])
             robot_y = float(confirmed_pose["y"])
             if not all(math.isfinite(value) for value in (robot_x, robot_y)):
-                raise LocalizationError("已确认的 AMCL 位姿无效")
+                raise LocalizationError("已确认的当前位姿无效")
+            # Accepting a manual seed does not create Nav2's live TF chain.
+            try:
+                transform = self.connector.get_transform(
+                    target_frame=frame_id,
+                    source_frame=self.base_frame,
+                    timeout_sec=2.0,
+                )
+                if transform is None:
+                    raise ValueError("TF 查询未返回坐标变换")
+            except Exception as exc:
+                message = (
+                    "已定位，但导航坐标变换不可用；初始坐标已获取，无需重新发布 2D Pose。"
+                    f"请检查 {frame_id} → {self.base_frame} TF：{exc}；"
+                    f"ros2 run tf2_ros tf2_echo {frame_id} {self.base_frame}"
+                )
+                _mark_navigation_failed(x, y, message)
+                return f"导航未启动：{message}"
             yaw, yaw_source = resolve_navigation_yaw(confirmed_pose, x, y)
             quat = _quaternion_from_yaw(yaw)
             goal = {
@@ -1209,7 +1255,7 @@ class NavigateToCoordinatesTool(BaseTool):
                 f"小车正在导航中，到达后会提示导航完成。"
             )
         except LocalizationError as e:
-            message = f"AMCL 定位不可用：{e}"
+            message = f"定位不可用：{e}"
             _mark_navigation_failed(x, y, message)
             logger.error(message)
             return f"导航未启动：{message}。"
