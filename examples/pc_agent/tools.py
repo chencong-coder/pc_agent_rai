@@ -1095,7 +1095,7 @@ class NavigateToCoordinatesTool(BaseTool):
     description: str = (
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
-        "导航前必须已通过页面的自动定位按钮完成 AMCL 定位。"
+        "导航前必须已通过页面的“获取初始坐标”按钮完成 AMCL 定位。"
         "只需要 x(m)、y(m)；若定位使用了 RViz 2D Pose Estimate，目标朝向"
         "沿用该 Pose 选择的 yaw，否则根据当前位置到目标计算朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "
@@ -1243,7 +1243,7 @@ class CancelNavigationTool(BaseTool):
                 action_id = _active_navigation_action_id
             if not action_id:
                 if localization_canceled:
-                    return "自动定位已取消，小车正在停止。"
+                    return "已取消获取初始坐标。"
                 return "当前没有可取消的导航任务。"
 
             # terminate_action expects the goal handle returned by start_action,
@@ -1251,7 +1251,7 @@ class CancelNavigationTool(BaseTool):
             _mark_navigation_canceling(action_id)
             self.connector.terminate_action(action_id)
             if localization_canceled:
-                return "自动定位和导航取消请求均已发送，小车正在停止。"
+                return "已取消获取初始坐标，并已发送导航取消请求，小车正在停止。"
             return "取消请求已发送，小车正在停止。"
         except Exception as e:
             if action_id:

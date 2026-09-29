@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AMCL localization state and automatic global-localization workflow."""
+"""RViz-seeded AMCL localization, with the legacy search workflow retained."""
 
 import logging
 import math
@@ -125,7 +125,7 @@ def get_localization_status() -> dict:
 
 
 def start_global_localization() -> bool:
-    """Start one background AMCL global-localization attempt."""
+    """Legacy UI entry point for acquiring a user-supplied initial pose."""
     with _active_manager_lock:
         manager = _active_manager
     if manager is None:
@@ -143,7 +143,7 @@ def cancel_global_localization() -> bool:
 
 
 class LocalizationManager:
-    """Confirm AMCL quality and trigger global localization when required."""
+    """Confirm seeded AMCL poses without triggering the retained global search."""
 
     def __init__(
         self,
@@ -199,7 +199,7 @@ class LocalizationManager:
         self._latest_initial_pose: Optional[dict] = None
         self._localization_mode: Optional[str] = None
         self._status = "waiting"
-        self._message = "等待 AMCL 定位数据"
+        self._message = "请先在 RViz 发布 2D Pose Estimate，再点击“获取初始坐标”"
         self._stable_samples = 0
         self._last_pose_at: Optional[float] = None
         self._initial_pose_yaw: Optional[float] = None
@@ -249,18 +249,16 @@ class LocalizationManager:
         }
 
     def _confirm_initial_pose_locked(self, initial_pose: dict) -> None:
+        """Use the RViz seed as metadata, then wait for actual AMCL samples."""
         self._localization_mode = "manual"
         self._initial_pose_yaw = initial_pose["yaw"]
-        self._last_pose_at = self._clock()
-        self._stable_samples = self.required_samples
-        self._confirm_pose_locked(
-            initial_pose["x"],
-            initial_pose["y"],
-            initial_pose["yaw"],
-        )
+        self._last_pose_at = None
+        self._stable_samples = 0
+        self._confirmed_pose = None
+        self._variances = (None, None, None)
         self._set_status_locked(
-            "localized",
-            "已使用 RViz 2D Pose Estimate 作为初始位姿",
+            "localizing",
+            "已获取 2D Pose Estimate，等待 /amcl_pose 连续稳定",
         )
 
     def _is_localized_locked(self, _now: float) -> bool:
@@ -322,7 +320,7 @@ class LocalizationManager:
             if self._status == "localized":
                 self._set_status_locked(
                     "waiting",
-                    "收到新的 RViz 初始位姿，请点击“自动定位”确认",
+                    "收到新的 RViz 初始位姿，请点击“获取初始坐标”确认",
                 )
             elif self._status == "localizing":
                 self._confirm_initial_pose_locked(initial_pose)
@@ -353,8 +351,7 @@ class LocalizationManager:
 
         with self._state_lock:
             if self._status == "localizing" and self._localization_mode == "pending":
-                # Do not confirm stale AMCL data while deciding whether this
-                # attempt uses RViz's seed or global rotating localization.
+                # Samples from before the selected RViz seed cannot confirm it.
                 return
             if (
                 self._last_pose_at is None
@@ -399,21 +396,12 @@ class LocalizationManager:
             elif self._status == "localized" and converged:
                 self._stable_samples = self.required_samples
                 self._confirm_pose_locked(x, y, yaw)
-            elif (
-                self._status == "localized"
-                and self._localization_mode == "manual"
-                and pose_is_valid
-            ):
-                # An explicit RViz pose is already an accepted starting pose.
-                # Continue refreshing the live position without requiring the
-                # global-localization covariance gate.
-                self._stable_samples = self.required_samples
-                self._confirm_pose_locked(x, y, yaw)
             elif self._status == "localized":
-                self._clear_confirmation_locked()
+                self._stable_samples = 0
+                self._confirmed_pose = None
                 self._set_status_locked(
-                    "waiting",
-                    "AMCL 定位质量已失效，请重新点击“自动定位”",
+                    "localizing",
+                    "AMCL 定位质量已失效，等待 /amcl_pose 重新连续稳定",
                 )
 
     def is_localized(self) -> bool:
@@ -467,69 +455,136 @@ class LocalizationManager:
 
     def require_localized(self) -> dict:
         """Return current quality state or reject navigation without moving."""
-        if self.is_localized():
-            return self.get_status()
         status = self.get_status()
+        if status["status"] == "localized" and status["pose"] is not None:
+            return status
         detail = status.get("message") or status.get("label")
         raise LocalizationError(
-            f"当前 AMCL 定位不可用（{detail}），请先在页面点击“自动定位”"
+            f"当前 AMCL 定位不可用（{detail}），"
+            "请先发布 2D Pose Estimate，点击“获取初始坐标”并等待 AMCL 连续稳定"
         )
 
     def _background_localization(self) -> None:
         try:
-            self.ensure_localized(force=True)
+            self.ensure_localized()
         except LocalizationCanceled:
-            logger.info("AMCL 自动定位已取消")
+            logger.info("获取初始坐标已取消")
         except LocalizationError:
-            logger.exception("AMCL 自动定位失败")
+            logger.exception("获取初始坐标失败")
         finally:
             with self._background_lock:
                 if self._background_thread is current_thread():
                     self._background_thread = None
 
     def start_global_localization(self) -> bool:
-        """Start global localization without blocking the Streamlit page."""
+        """Acquire the RViz seed in the background; never start global search."""
         with self._background_lock:
             if (
                 self._background_thread is not None
                 and self._background_thread.is_alive()
             ):
                 return False
-            self._cancel_event.clear()
             with self._state_lock:
-                self._clear_confirmation_locked()
-                self._last_pose_at = None
-                self._localization_mode = "pending"
-                self._set_status_locked(
-                    "localizing",
-                    "正在读取最新初始位姿，准备 AMCL 定位",
-                )
+                if self._is_localized_locked(self._clock()):
+                    return False
+                self._cancel_event.clear()
+                if self._status != "localizing":
+                    self._clear_confirmation_locked()
+                    self._last_pose_at = None
+                    self._localization_mode = "pending"
+                    self._set_status_locked(
+                        "localizing",
+                        "正在获取初始坐标，等待 AMCL 连续稳定",
+                    )
             self._background_thread = Thread(
                 target=self._background_localization,
-                name="amcl-global-localization",
+                name="amcl-initial-pose-acquisition",
                 daemon=True,
             )
             self._background_thread.start()
             return True
 
     def cancel_global_localization(self) -> bool:
-        """Cancel an active attempt and send an immediate zero velocity."""
+        """Cancel the passive wait without publishing any motion command."""
         with self._state_lock:
             active = self._status == "localizing"
             if active:
+                self._cancel_event.set()
                 self._clear_confirmation_locked()
-                self._set_status_locked("waiting", "自动定位已取消")
-        if not active:
-            return False
-
-        self._cancel_event.set()
-        try:
-            self._publish_rotation(0.0)
-        except Exception:
-            logger.exception("取消自动定位时发送停止指令失败")
-        return True
+                self._set_status_locked("waiting", "获取初始坐标已取消")
+            return active
 
     def ensure_localized(self, force: bool = False) -> dict:
+        """Wait for seeded AMCL convergence without resetting or moving AMCL.
+
+        RViz publishes /initialpose directly to AMCL. We only observe that seed
+        and subsequent /amcl_pose samples; retries never republish /initialpose.
+        The legacy global-localization routine below is deliberately not called.
+        """
+        with self._operation_lock:
+            if not force and self.is_localized():
+                return self.get_status()
+            if self._cancel_event.is_set():
+                raise LocalizationCanceled("获取初始坐标已取消")
+
+            with self._state_lock:
+                if force or self._status != "localizing":
+                    self._clear_confirmation_locked()
+                    self._last_pose_at = None
+                    self._localization_mode = "pending"
+                    self._set_status_locked(
+                        "localizing",
+                        "正在获取初始坐标，等待 AMCL 连续稳定",
+                    )
+
+            seed_deadline = self._clock() + _INITIAL_POSE_WAIT_SEC
+            deadline = self._clock() + self.timeout_sec
+            try:
+                while True:
+                    with self._state_lock:
+                        if self._cancel_event.is_set():
+                            raise LocalizationCanceled("获取初始坐标已取消")
+                        has_seed = self._latest_initial_pose is not None
+                        if has_seed and self._localization_mode == "pending":
+                            self._confirm_initial_pose_locked(self._latest_initial_pose)
+
+                    if self.is_localized():
+                        return self.get_status()
+                    now = self._clock()
+                    if not has_seed and now >= min(seed_deadline, deadline):
+                        raise LocalizationError(
+                            "未收到 2D Pose Estimate，请先在 RViz 发布初始位姿，"
+                            "再点击“获取初始坐标”"
+                        )
+                    if now >= deadline:
+                        raise LocalizationError(
+                            f"AMCL 在 {self.timeout_sec:g} 秒内未连续稳定，"
+                            "可再次点击“获取初始坐标”继续等待，无需重新发布初始位姿"
+                        )
+                    next_deadline = deadline if has_seed else min(seed_deadline, deadline)
+                    self._sleep(min(self.command_period_sec, next_deadline - now))
+            except LocalizationCanceled:
+                with self._state_lock:
+                    self._clear_confirmation_locked()
+                    self._localization_mode = None
+                    self._set_status_locked("waiting", "获取初始坐标已取消")
+                raise
+            except Exception as exc:
+                error = (
+                    exc
+                    if isinstance(exc, LocalizationError)
+                    else LocalizationError(f"获取 AMCL 定位数据失败：{exc}")
+                )
+                self._mark_failed(str(error))
+                with self._state_lock:
+                    self._localization_mode = None
+                if error is exc:
+                    raise
+                raise error from exc
+
+    def _legacy_ensure_localized(self, force: bool = False) -> dict:
+        # Retained for reference only. No page, navigation or retry path calls
+        # this routine; all active callers use the passive ensure_localized().
         """Confirm AMCL from RViz or fall back to global rotating localization."""
         with self._operation_lock:
             if not force and self.is_localized():
