@@ -1095,7 +1095,7 @@ class NavigateToCoordinatesTool(BaseTool):
     description: str = (
         "控制小车导航到指定的 map 坐标。"
         "用户明确提供 x、y 时直接调用本工具，不需要先调用 get_detections。"
-        "导航前必须已通过页面的“获取初始坐标”按钮完成 AMCL 定位。"
+        "导航前必须已通过页面的“获取初始坐标”按钮获取用户发布的 2D Pose。"
         "只需要 x(m)、y(m)；若定位使用了 RViz 2D Pose Estimate，目标朝向"
         "沿用该 Pose 选择的 yaw，否则根据当前位置到目标计算朝向。"
         "例如用户说‘去 map 坐标 x=-4.2, y=2.97’，调用 "

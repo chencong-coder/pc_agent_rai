@@ -190,7 +190,7 @@ def render_robot_status() -> None:
 
     st.markdown("#### 小车实时位置")
     if localization_state == "localizing":
-        st.info(localization_status.get("message") or "等待 AMCL 连续稳定")
+        st.info(localization_status.get("message") or "等待接收 2D Pose Estimate")
     elif localization_state == "localized" and pose:
         updated_at = datetime.fromtimestamp(
             float(pose["updated_at"]),
@@ -201,8 +201,14 @@ def render_robot_status() -> None:
         columns[1].metric("Y（map，米）", f"{pose['y']:.3f}")
         columns[2].metric("Yaw（弧度）", f"{pose['yaw']:.3f}")
         columns[3].metric("本地更新时间", updated_at)
+        if pose.get("source") == "/initialpose":
+            st.caption("位置来源：2D Pose Estimate，等待 AMCL 更新")
+        elif localization_status.get("fresh"):
+            st.caption("位置来源：AMCL")
+        else:
+            st.caption("位置来源：AMCL，暂未收到新消息，保留最后位置")
     elif localization_state == "failed":
-        detail = localization_status.get("message") or "AMCL 定位失败"
+        detail = localization_status.get("message") or "初始坐标获取失败"
         st.error(f"暂无有效位置：{detail}")
     else:
         st.info("暂无有效位置")
@@ -248,16 +254,14 @@ def render_localization_controls() -> None:
 
     if locate_submitted:
         try:
-            started = start_global_localization()
+            start_global_localization()
         except LocalizationError as exc:
             st.error(f"无法获取初始坐标：{exc}")
         else:
-            if started:
-                st.info("正在获取你发布的 2D Pose Estimate，等待 AMCL 连续稳定后更新实时位置")
-            elif get_localization_status().get("status") == "localized":
+            if get_localization_status().get("status") == "localized":
                 st.info("初始坐标已确认，正在持续读取 /amcl_pose 更新实时位置")
             else:
-                st.info("正在获取初始坐标并等待 AMCL 连续稳定")
+                st.info("等待接收你发布的 2D Pose Estimate")
 
     if cancel_submitted:
         try:
@@ -272,7 +276,7 @@ def render_localization_controls() -> None:
 
     localization = get_localization_status()
     st.caption(
-        f"AMCL：{localization.get('label', '等待定位')} · "
+        f"定位：{localization.get('label', '等待定位')} · "
         f"{localization.get('message', '')}"
     )
 
@@ -320,7 +324,7 @@ def initialize_agent() -> None:
     st.session_state.connector = connector
     clear_detection_history()
     st.session_state.messages = [
-        AIMessage(content="已连接。请先在 RViz 发布 2D Pose Estimate，点击“获取初始坐标”并等待定位稳定，再输入地图坐标或目标类别。")
+        AIMessage(content="已连接。请先在 RViz 发布 2D Pose Estimate，点击“获取初始坐标”后即可使用该位置，再输入地图坐标或目标类别。")
     ]
     st.session_state.tool_events = []
     st.session_state.last_audio_hash = None
